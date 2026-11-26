@@ -1,0 +1,17 @@
+[Unit]
+Description=Kairos OneBot v11 chat runtime
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=kairos
+WorkingDirectory=/opt/kairos
+EnvironmentFile=/opt/kairos/.env
+ExecStart=/opt/kairos/.venv/bin/python -m kairos.main --config /opt/kairos/config/global.yaml --bots-dir /opt/kairos/config/bots
+MemoryMax=256M
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
