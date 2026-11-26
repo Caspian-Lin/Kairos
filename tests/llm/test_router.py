@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack
 
 import httpx
 import pytest
+from hpack import Encoder
 
 from kairos.config import LLMModelConfig
 from kairos.llm import LLMConfigError, LLMRequestError, LLMResponseError, LLMRouter, router
@@ -60,6 +61,21 @@ def backoffs(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
     monkeypatch.setattr(router, "sleep", record_delay)
     return delays
+
+
+def test_wire_debug_logs_are_filtered(
+    make_router: RouterFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    make_router(lambda _: _completion())
+    with caplog.at_level(logging.DEBUG, logger="hpack.hpack"):
+        Encoder().encode([(b"authorization", f"Bearer {_API_KEY}".encode(), True)])
+    for name in ("httpcore.http11", "httpcore.http2"):
+        with caplog.at_level(logging.DEBUG, logger=name):
+            logging.getLogger(name).debug("wire headers: %s", _API_KEY)
+    with caplog.at_level(logging.DEBUG, logger="kairos.llm.router"):
+        logging.getLogger("kairos.llm.router").debug("Kairos debug message")
+
+    assert [record.getMessage() for record in caplog.records] == ["Kairos debug message"]
 
 
 async def test_routes_to_models_and_parses_completion(make_router: RouterFactory) -> None:

@@ -1,5 +1,6 @@
 """Shared asynchronous client for OpenAI-compatible chat models."""
 
+import logging
 import random
 import time
 from asyncio import Semaphore, sleep
@@ -12,6 +13,12 @@ from kairos.models import ChatMessage, LLMResult
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _ALLOWED_OVERRIDES = {"temperature", "max_tokens", "stop", "response_format"}
+_WIRE_LOGGERS = ("hpack.hpack", "httpcore.http11", "httpcore.http2")
+
+
+def _hide_debug_wire_logs(record: logging.LogRecord) -> bool:
+    """Keep protocol traces that can contain headers out of application logs."""
+    return record.levelno >= logging.INFO
 
 
 class LLMError(Exception):
@@ -43,6 +50,8 @@ class LLMRouter:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        for name in _WIRE_LOGGERS:
+            logging.getLogger(name).addFilter(_hide_debug_wire_logs)
         self._models = models.copy()
         self._slots = {key: Semaphore(cfg.max_concurrency) for key, cfg in self._models.items()}
         self._client = httpx.AsyncClient(
