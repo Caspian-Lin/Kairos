@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kairos"
+version = "0.1.0"
+description = "Multi-bot QQ chat runtime"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp",
+    "alembic",
+    "asyncpg",
+    "httpx[http2]",
+    "pydantic>=2.7",
+    "pyyaml",
+    "structlog",
+    "uvloop",
+]
+
+[dependency-groups]
+dev = ["mypy", "pytest", "pytest-asyncio", "ruff"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kairos"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.format]
+exclude = ["Kairos_设计文档/**"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["pg: requires a PostgreSQL test database"]
