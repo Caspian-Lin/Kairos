@@ -1,0 +1,19 @@
+postgres:
+  dsn: "${KAIROS_PG_DSN}"
+
+onebot_ws:
+  host: 127.0.0.1
+  port: 8080
+  path: /onebot/v11/ws
+  access_token: "${KAIROS_ONEBOT_ACCESS_TOKEN}"
+
+llm_models:
+  chat_model:
+    base_url: https://api.openai.com/v1
+    api_key: "${OPENAI_API_KEY}"
+    model: gpt-4o-mini
+  # M2 can add gate_model and worker_model entries using the same fields.
+
+logging:
+  level: INFO
+  json_format: false
