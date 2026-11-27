@@ -8,7 +8,7 @@ import httpx
 import pytest
 from hpack import Encoder
 
-from kairos.config import LLMModelConfig, LLMProvider
+from kairos.config import LLMAPIFormat, LLMModelConfig, LLMProvider
 from kairos.llm import LLMConfigError, LLMRequestError, LLMResponseError, LLMRouter, router
 from kairos.models import ChatMessage
 
@@ -310,6 +310,56 @@ async def test_gemini_preset_maps_history_and_excludes_thought_parts(
     result = await make_router(handle, {"chat": model}).chat_completion("chat", history)
     assert result.content == "在呢"
     assert (result.prompt_tokens, result.completion_tokens) == (9, 2)
+
+
+@pytest.mark.parametrize(
+    ("provider", "api_format"),
+    [
+        ("openai", "openai_responses"),
+        ("openai", "openai_chat_completions"),
+        ("openai_compatible", "openai_chat_completions"),
+        ("opencode_go", "openai_responses"),
+        ("opencode_go", "gemini_generate_content"),
+        ("google_ai_studio", "gemini_generate_content"),
+        ("anthropic", "anthropic_messages"),
+    ],
+)
+async def test_json_mode_maps_to_the_provider_wire_format(
+    make_router: RouterFactory, provider: LLMProvider, api_format: LLMAPIFormat
+) -> None:
+    response_format = {"type": "json_object"}
+    reply = '{"action":"pass"}'
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if api_format == "openai_chat_completions":
+            assert body["response_format"] == response_format
+            response = {"choices": [{"message": {"content": reply}}]}
+        elif api_format == "openai_responses":
+            assert body["text"] == {"format": response_format}
+            assert "response_format" not in body
+            response = {
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": reply}]}]
+            }
+        elif api_format == "gemini_generate_content":
+            assert body["generationConfig"] == {"responseMimeType": "application/json"}
+            response = {"candidates": [{"content": {"parts": [{"text": reply}]}}]}
+        else:
+            assert "response_format" not in body and "text" not in body
+            response = {"content": [{"type": "text", "text": reply}]}
+        return httpx.Response(200, json=response)
+
+    model = LLMModelConfig(
+        provider=provider,
+        api_format=api_format,
+        api_key=_API_KEY,
+        model="test-gate",
+        base_url="https://test.invalid/v1" if provider == "openai_compatible" else None,
+    )
+    result = await make_router(handle, {"gate": model}).chat_completion(
+        "gate", _MESSAGES, response_format=response_format
+    )
+    assert result.content == reply
 
 
 async def test_retries_rate_limit_and_service_unavailable(
