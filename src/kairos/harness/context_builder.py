@@ -5,8 +5,12 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from kairos.config import BotProfile
+from kairos.harness.compactor import clip_to_tokens, estimate_tokens
 from kairos.harness.postprocess import SILENT_ACTION
-from kairos.models import ChatMessage, NormalizedMessage
+from kairos.harness.thread_tracker import format_thread_board
+from kairos.models import ChatMessage, GateDecision, NormalizedMessage, WarmMemory
+
+_TURN_TOKENS = 4
 
 
 def format_relative_time(delta_seconds: float) -> str:
@@ -37,6 +41,11 @@ class ContextBuilder:
         messages: Sequence[NormalizedMessage],
         roster: Sequence[str],
         now: datetime | None = None,
+        *,
+        warm_memory: WarmMemory | None = None,
+        gate_decision: GateDecision | None = None,
+        token_budget: int | None = None,
+        enable_react: bool = False,
     ) -> list[ChatMessage]:
         """Keep each speaker's historical role and render timing in group-chat turns."""
         reference_time = datetime.now(UTC) if now is None else _utc(now)
@@ -51,10 +60,62 @@ class ContextBuilder:
             f"如果决定沉默，仅输出 {SILENT_ACTION}。\n"
             "回复时直接用第一人称写要发到群里的正文。按话题决定篇幅，开头省略 [mID]、[-Xs]、[我] 等标签。"
         )
+        if enable_react:
+            prompt += "\n若适合贴表情，仅输出 <|act:react:mID:emoji_id|>，使用群聊中的消息 ID。"
+        if gate_decision is not None and (gate_decision.candidate_target or gate_decision.reason):
+            target = (
+                f"m{gate_decision.candidate_target}" if gate_decision.candidate_target else "无"
+            )
+            prompt += (
+                f"\n初筛建议目标 {target}，理由：{gate_decision.reason or '无'}。"
+                "仅供参考，可自行修正对象、保持沉默或改贴表情。"
+            )
+        if warm_memory is not None:
+            prompt += _memory_sections(warm_memory)
+
+        ordered = sorted(messages, key=lambda item: _utc(item.created_at))
+        if token_budget is None:
+            return ContextBuilder._dialogue_turns(prompt, ordered, reference_time)
+        if token_budget < _TURN_TOKENS:
+            return []
+
+        latest_user = next((message for message in reversed(ordered) if not message.is_bot), None)
+        latest_turn = (
+            ContextBuilder._dialogue_turns("", (latest_user,), reference_time)[1]
+            if latest_user is not None
+            else None
+        )
+        reserve = min(_turn_cost(latest_turn), token_budget // 4) if latest_turn is not None else 0
+        prompt = clip_to_tokens(prompt, token_budget - _TURN_TOKENS - reserve)
+        turns = ContextBuilder._dialogue_turns(prompt, ordered, reference_time)
+        if sum(map(_turn_cost, turns)) <= token_budget:
+            return turns
+
+        # A cut can land inside a user block. Rebuild the longest suffix that fits
+        # so a leading assistant turn and its orphaned timeline markers are removed.
+        low, high = 1, len(ordered)
+        while low < high:
+            middle = (low + high) // 2
+            candidate = ContextBuilder._dialogue_turns(prompt, ordered[middle:], reference_time)
+            if sum(map(_turn_cost, candidate)) <= token_budget:
+                high = middle
+            else:
+                low = middle + 1
+        turns = ContextBuilder._dialogue_turns(prompt, ordered[low:], reference_time)
+        if len(turns) == 1 and latest_turn is not None:
+            available = token_budget - _turn_cost(turns[0]) - _TURN_TOKENS
+            if content := clip_to_tokens(latest_turn.content, available):
+                turns.append(ChatMessage(role="user", content=content))
+        return turns
+
+    @staticmethod
+    def _dialogue_turns(
+        prompt: str, messages: Sequence[NormalizedMessage], reference_time: datetime
+    ) -> list[ChatMessage]:
         turns = [ChatMessage(role="system", content=prompt)]
         previous_activity: datetime | None = None
 
-        for message in sorted(messages, key=lambda item: _utc(item.created_at)):
+        for message in messages:
             previous_turn = turns[-1]
             if message.is_bot and previous_turn.role == "system":
                 continue
@@ -96,3 +157,33 @@ class ContextBuilder:
             previous_activity = _utc(message.latest_at)
 
         return turns
+
+
+def _turn_cost(turn: ChatMessage) -> int:
+    return _TURN_TOKENS + estimate_tokens(turn.content)
+
+
+def _memory_sections(memory: WarmMemory) -> str:
+    sections = []
+    if memory.summaries:
+        summaries = sorted(memory.summaries, key=lambda item: _utc(item.covered_until_at))
+        sections.append(
+            "历史对话摘要\n"
+            + "\n".join(
+                f"截至 {_utc(summary.covered_until_at).isoformat()} [m{summary.covered_until_msg_id}]："
+                f"{summary.summary_text}"
+                for summary in summaries
+            )
+        )
+    if memory.impressions:
+        sections.append(
+            "群友画像\n"
+            + "\n".join(
+                f"{item.nickname}：{item.impression_summary}" for item in memory.impressions
+            )
+        )
+    if memory.notes:
+        sections.append("相关事件笔记\n" + "\n".join(note.summary_text for note in memory.notes))
+    if memory.threads:
+        sections.append("活跃线程板\n" + format_thread_board(memory.threads))
+    return "\n\n" + "\n\n".join(sections) if sections else ""
