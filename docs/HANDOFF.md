@@ -1,6 +1,6 @@
 # Kairos 当前进度与交接
 
-更新于 2026-11-27（北京时间）。Stage 1-B（M2）已完成配置、协议、存储、运行时和本地回放验收。M2 功能按 Bot 启用，下一阶段是 Stage 1-C（M3）。 [M2 配置](../README.md#m2-可选配置) · [Stage 1 实现规划](Kairos_设计文档/02_Kairos_Stage1_技术栈与2C4G工程实现规划.md)
+更新于 2026-11-28（北京时间）。M2.1 已完成 64k→16k 压缩、按需挂载工具 Schema、上下文追踪和本地 Admin 管理台。下一阶段是 Stage 1-C（M3）。 [Bot 配置](../README.md#m21-可选配置) · [Admin 启用](../README.md#本地-admin-管理台) · [Stage 1 实现规划](Kairos_设计文档/02_Kairos_Stage1_技术栈与2C4G工程实现规划.md)
 
 ## 已实现的行为
 
@@ -16,6 +16,10 @@
 | 在线状态 | NapCat 反向连接建立后，Bot 按北京时间向白名单首群发问候。群友戳一戳 Bot 时，在原群回复 `QAQ`。 |
 
 上下文默认保留 40 个消息块，同一群友间隔不超过 10 秒的相邻连发可合并，数据库逐条保留原始消息。启用压缩时，首次会话加载持久化摘要并按水位线续接原文。系统提示包含摘要、活跃线程板和可用的热记忆。预算裁剪后，历史中的 Bot 发言仍使用原生 `assistant` 角色，第一条对话轮次为 `user`。 [群会话](../src/kairos/runtime/group_session.py) · [上下文构建](../src/kairos/harness/context_builder.py)
+
+M2.1 压缩默认在 65,536 Token 或窗口淘汰前触发，以 16,384 Token 为摘要上限，最多三次尝试。全败时记录重置水位线，后续构建只继承新对话和仍适用的长期记忆。门控只看已注册工具的简短目录，主模型请求按需携带选中的 Schema。
+
+Admin 绑定 `127.0.0.1`，默认关闭。设置 `admin_ui.enabled` 并配置访问令牌后，可以通过日志和流水线查阅模型请求，保存非敏感 Bot YAML 并热重载。页面触发全进程重启时，Kairos 先关闭 Admin、网关和后台资源，再执行重启钩子。 [Admin 启用说明](../README.md#本地-admin-管理台)
 
 ## WSL 联调环境
 
@@ -46,9 +50,9 @@ NapCat 通过 [本机 WebUI](http://127.0.0.1:6099/webui/) 登录。接入 Kairo
 
 ## 验证记录
 
-- 独立 PostgreSQL 16 测试库运行 `uv run pytest -q -rs`，通过 280 项，无跳过。已验证 M2 迁移升级与回滚、群级和 Bot 级数据隔离、关键词与 trigram 召回。`ruff check .`、`ruff format --check .` 和 `git diff --check` 均通过。 [测试说明](../README.md#测试和内存压测)
+- 独立 PostgreSQL 16 测试库通过 350 项测试，无跳过。新增覆盖包括压缩重置、热重载、优雅重启、脱敏日志与追踪、配置编辑、Admin API 和 SSE。Chromium 验证了登录、实时日志、草稿 Context 预览和流水线详情。 [测试说明](../README.md#测试和内存压测)
 - 本地协议回放使用真实 WebSocket 和本地模型 HTTP 接口，覆盖 M1 交互及 M2 初筛沉默、两条贴表情路径、主脑 Veto、摘要重启恢复、热记忆和精力值限流。 [回放测试](../tests/integration/test_e2e_pipeline.py)
-- M2 内存压测回放 3 个 Bot、30 个会话和 5,000 条消息，普通本地运行的稳态 RSS 为 68.08 MB，绑定两颗逻辑 CPU 且 cgroup 内存限制为 4 GiB 时为 68.17 MB。两次均低于 180 MB 红线，每群最多 40 个消息块、20 个线程和 3 条热摘要。 [压测脚本](../scripts/bench_memory.py)
+- M2.1 内存压测回放 3 个 Bot、30 个会话和 5,000 条消息。普通本地运行的稳态 RSS 为 73.88 MB，绑定两颗逻辑 CPU 且 cgroup 内存限制为 4 GiB 时为 74.02 MB，两次均低于 180 MB。保留 500 条日志和 100 条流水线追踪。 [压测脚本](../scripts/bench_memory.py)
 - 上次真实群联调已确认反向连接、上线问候和 `QAQ`。M2 真实群验收待在约定白名单内联调。
 
 ## 接续工作

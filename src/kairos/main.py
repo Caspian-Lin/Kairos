@@ -8,10 +8,13 @@ import signal
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
 
 import structlog
 
+from kairos.admin.config_editor import BotConfigEditor
+from kairos.admin.server import AdminServer
 from kairos.config import (
     BotProfile,
     GlobalConfig,
@@ -282,11 +285,20 @@ async def run(
     *,
     restart_controller: RestartController | None = None,
     trace_store: PipelineTraceStore | None = None,
+    log_buffer: LogRingBuffer | None = None,
+    bots_dir: str | Path = "config/bots",
 ) -> None:
     """Serve the configured bots until a shutdown signal."""
     loop = asyncio.get_running_loop()
     controller = RestartController() if restart_controller is None else restart_controller
     stop = controller.stop
+    if config.admin_ui.enabled:
+        secrets = _admin_secrets(config, profiles)
+        if log_buffer is None:
+            log_buffer = LogRingBuffer(config.admin_ui.log_buffer_size, secrets=secrets)
+            _configure_logging(config.logging, log_buffer)
+        if trace_store is None:
+            trace_store = PipelineTraceStore(config.admin_ui.trace_buffer_size, secrets=secrets)
     async with AsyncExitStack() as resources:
         if os.name == "posix":
             for signum in (signal.SIGINT, signal.SIGTERM):
@@ -326,6 +338,49 @@ async def run(
         resources.push_async_callback(gateway.stop)
         await gateway.start()
 
+        if config.admin_ui.enabled and log_buffer is not None and trace_store is not None:
+            logs, traces = log_buffer, trace_store
+            editor = BotConfigEditor(bots_dir, config)
+            active_profiles = profiles
+            reload_lock = asyncio.Lock()
+
+            def active_secrets() -> set[str]:
+                return _admin_secrets(config, active_profiles)
+
+            async def reload_from_disk() -> None:
+                nonlocal active_profiles
+                async with reload_lock:
+                    latest = await asyncio.to_thread(load_bot_profiles, bots_dir, config)
+                    latest_clients = {
+                        profile.bot_id: llm_client.for_models(profile.llm)
+                        for profile in latest
+                        if profile.llm
+                    }
+                    secrets_in_use = active_secrets() | _admin_secrets(config, latest)
+                    logs.set_secrets(secrets_in_use)
+                    traces.set_secrets(secrets_in_use)
+                    try:
+                        await manager.reload_profiles(latest, latest_clients)
+                    finally:
+                        active_profiles = [runtime.profile for runtime in manager.runtimes.values()]
+                        logs.set_secrets(active_secrets())
+                        traces.set_secrets(active_secrets())
+
+            admin = AdminServer(
+                config.admin_ui,
+                manager,
+                gateway,
+                editor,
+                logs,
+                traces,
+                reload_profiles=reload_from_disk,
+                request_restart=controller.request_restart,
+                secrets=active_secrets,
+            )
+            resources.push_async_callback(admin.stop)
+            await admin.start()
+            _log.info("kairos_admin_ready", port=admin.port)
+
         _log.info(
             "kairos_ready",
             host=config.onebot_ws.host,
@@ -334,6 +389,18 @@ async def run(
         )
         await stop.wait()
     controller.restart_after_shutdown()
+
+
+def _admin_secrets(config: GlobalConfig, profiles: Sequence[BotProfile]) -> set[str]:
+    values = {config.postgres.dsn, config.onebot_ws.access_token, config.admin_ui.access_token}
+    values.update(model.api_key for model in config.llm_models.values())
+    values.update(model.api_key for profile in profiles for model in profile.llm.values())
+    values.update(
+        value
+        for name, value in os.environ.items()
+        if any(part in name.upper() for part in ("API_KEY", "TOKEN", "PASSWORD", "SECRET", "DSN"))
+    )
+    return {value for value in values if value}
 
 
 def _configure_logging(config: LoggingConfig, log_buffer: LogRingBuffer | None = None) -> None:
@@ -371,16 +438,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_global_config(args.config)
         profiles = load_bot_profiles(args.bots_dir, config)
-        _configure_logging(config.logging)
+        log_buffer = (
+            LogRingBuffer(config.admin_ui.log_buffer_size, secrets=_admin_secrets(config, profiles))
+            if config.admin_ui.enabled
+            else None
+        )
+        _configure_logging(config.logging, log_buffer)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
 
     if sys.platform.startswith("linux"):
         import uvloop
 
-        uvloop.run(run(config, profiles))
+        uvloop.run(run(config, profiles, log_buffer=log_buffer, bots_dir=args.bots_dir))
     else:
-        asyncio.run(run(config, profiles))
+        asyncio.run(run(config, profiles, log_buffer=log_buffer, bots_dir=args.bots_dir))
     return 0
 
 

@@ -35,6 +35,8 @@ from kairos.models import (
     UserImpression,
 )
 from kairos.telemetry.audit_logger import AuditLogger
+from kairos.telemetry.log_buffer import LogRingBuffer
+from kairos.telemetry.trace_store import PipelineTraceStore
 
 _BOTS = 3
 _GROUPS_PER_BOT = 10
@@ -45,6 +47,8 @@ _THREAD_LIMIT = 20
 _TRACKED_MESSAGE_LIMIT = 256
 _HOT_CACHE_LIMIT = 64
 _SUMMARY_LIMIT = 3
+_LOG_LIMIT = 500
+_TRACE_LIMIT = 100
 _RSS_LIMIT = 180_000_000
 _MB = 1_000_000
 _REPLIES = ("今晚吃云吞", "我在上桥看河", "窗边的花开了", "这首歌循环了好久")
@@ -53,7 +57,8 @@ _REPLIES = ("今晚吃云吞", "我在上桥看河", "窗边的花开了", "这�
 class CountingStore:
     """Simulate the database with bounded summary storage and representative memory."""
 
-    def __init__(self) -> None:
+    def __init__(self, logs: LogRingBuffer) -> None:
+        self._logs = logs
         self.inbound = 0
         self.replies = 0
         self.audits = 0
@@ -77,6 +82,16 @@ class CountingStore:
             self.inbound += 1
 
     async def save_audit_log(self, record: AuditRecord) -> None:
+        self._logs.processor(
+            None,
+            "info",
+            {
+                "event": "decision_recorded",
+                "bot_id": record.bot_id,
+                "group_id": record.group_id,
+                "outcome": record.stale_action,
+            },
+        )
         self.audits += 1
         self._progress.set()
 
@@ -215,6 +230,8 @@ class Benchmark:
     max_thread_messages: int
     hot_groups: int
     max_summaries: int
+    logs: int
+    traces: int
 
 
 def _rss_bytes() -> int:
@@ -248,7 +265,8 @@ def _event(index: int, profiles: list[BotProfile]) -> RawGroupEvent:
 
 
 async def _exercise() -> Benchmark:
-    store, llm, sender = CountingStore(), MockModel(), EchoSender()
+    logs, traces = LogRingBuffer(_LOG_LIMIT), PipelineTraceStore(_TRACE_LIMIT)
+    store, llm, sender = CountingStore(logs), MockModel(), EchoSender()
     profiles = [
         BotProfile(
             bot_id=f"benchmark_{bot}",
@@ -262,8 +280,9 @@ async def _exercise() -> Benchmark:
             gate=GateConfig(enabled=True, energy_max=1_000, energy_recover_per_min=0),
             compaction=CompactionConfig(
                 enabled=True,
-                input_token_budget=512,
-                summary_max_tokens=64,
+                input_token_budget=65536,
+                trigger_tokens=65536,
+                target_summary_tokens=16384,
                 max_persisted_summaries=_SUMMARY_LIMIT,
             ),
             memory=MemoryConfig(enabled=True, max_impressions_recalled=3),
@@ -274,7 +293,14 @@ async def _exercise() -> Benchmark:
     ]
     audit = AuditLogger(store)
     manager = MultiBotManager(
-        profiles, store, llm, sender, audit, summary_store=store, memory_store=store
+        profiles,
+        store,
+        llm,
+        sender,
+        audit,
+        summary_store=store,
+        memory_store=store,
+        trace_store=traces,
     )
     worker = manager.memory_worker
     if worker is None:
@@ -349,6 +375,16 @@ async def _exercise() -> Benchmark:
         ):
             raise RuntimeError("The workload did not exercise every M2 memory path")
 
+        log_count = len(logs.recent(limit=_LOG_LIMIT + 1))
+        trace_count = len(traces._ring.snapshots())
+        latest = traces.list_recent(limit=1)
+        if not (
+            log_count == min(_LOG_LIMIT, expected_turns)
+            and trace_count == min(_TRACE_LIMIT, expected_turns)
+            and latest[0].request_context is not None
+        ):
+            raise RuntimeError("M2.1 telemetry did not cover the expected turns")
+
         # Sample the resident data after asynchronous writes settle, with caches still live.
         gc.collect()
         return Benchmark(
@@ -365,6 +401,8 @@ async def _exercise() -> Benchmark:
             max_thread_messages,
             hot_groups,
             max_summaries,
+            log_count,
+            trace_count,
         )
 
 
@@ -396,6 +434,7 @@ def main() -> int:
         f"hot groups {result.hot_groups}/{_HOT_CACHE_LIMIT}, "
         f"max cached summaries per group {result.max_summaries}/{_SUMMARY_LIMIT}"
     )
+    print(f"M2.1 retained logs {result.logs}/{_LOG_LIMIT}, traces {result.traces}/{_TRACE_LIMIT}")
     if result.rss >= _RSS_LIMIT:
         print("Kairos Core exceeded the steady RSS limit", file=sys.stderr)
         return 1
