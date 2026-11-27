@@ -18,7 +18,10 @@ _EMOJI_ID = re.compile(r"([0-9]+)")
 
 
 def _gate_prompt(
-    profile: BotProfile, messages: Sequence[NormalizedMessage], threads: Sequence[ThreadSummary]
+    profile: BotProfile,
+    messages: Sequence[NormalizedMessage],
+    threads: Sequence[ThreadSummary],
+    tool_catalog: str,
 ) -> list[ChatMessage]:
     persona = profile.gate.persona_card or profile.persona_prompt[:150]
     system = (
@@ -28,6 +31,11 @@ def _gate_prompt(
         "动作可选 pass、silent、react。无目标或表情用 null，"
         "贴表情时填 QQ 表情 ID（常用：76赞、66爱心、13呲牙、79胜利、63玫瑰）。"
     )
+    if tool_catalog:
+        system += (
+            f"\n可用工具：{tool_catalog}。"
+            '确有需要时才在 JSON 中加入 "need_tools": ["工具名"]，根据目录选择名称。'
+        )
     board = " ".join(
         f"m{thread.latest_msg_id[:16]}({thread.message_count})" for thread in threads[:4]
     )
@@ -57,7 +65,7 @@ def _parse_id(value: object, pattern: re.Pattern[str]) -> str | None:
     return match[1] if match else None
 
 
-def _parse_decision(content: str) -> GateDecision:
+def _parse_decision(content: str, *, allow_tools: bool) -> GateDecision:
     decoder = json.JSONDecoder()
     text = content[:4096]
     for opening in re.finditer(r"\{", text):
@@ -75,11 +83,22 @@ def _parse_decision(content: str) -> GateDecision:
         if action is GateAction.REACT and emoji is None:
             return GateDecision(action=GateAction.SILENT, reason="gate_invalid_reaction")
         reason = data.get("reason")
+        names = data.get("need_tools") if allow_tools and action is GateAction.PASS else None
+        requested = (
+            list(
+                dict.fromkeys(
+                    name.strip() for name in names if isinstance(name, str) and name.strip()
+                )
+            )
+            if isinstance(names, list)
+            else []
+        )
         return GateDecision(
             action=action,
             candidate_target=target,
             emoji_id=emoji if action is GateAction.REACT else None,
             reason=reason.strip()[:120] if isinstance(reason, str) else "",
+            need_tools=requested,
         )
     raise ValueError("Invalid gate JSON")
 
@@ -95,29 +114,38 @@ class ModelGate(GateHook):
         threads: Sequence[ThreadSummary] = (),
         *,
         latest_msg: NormalizedMessage | None = None,
+        tool_catalog: str = "",
     ) -> GateDecision:
         model_key = profile.gate_model_key
         if not profile.gate.enabled or model_key is None:
             return GateDecision(action=GateAction.PASS, reason="gate_disabled")
 
         latest = latest_msg or (messages[-1] if messages else None)
-        if latest is not None and (latest.is_at_bot or latest.is_reply_to_bot):
-            return GateDecision(
+        direct = (
+            GateDecision(
                 action=GateAction.PASS, candidate_target=latest.last_msg_id, reason="direct_address"
             )
+            if latest is not None and (latest.is_at_bot or latest.is_reply_to_bot)
+            else None
+        )
+        if direct is not None and not tool_catalog:
+            return direct
 
+        prompt = _gate_prompt(profile, messages, threads, tool_catalog)
+        if direct is not None:
+            prompt[0].content += "\n本条为直接提问，请放行并按需选择工具。"
         started = perf_counter()
         try:
             async with asyncio.timeout(profile.gate.timeout_seconds):
                 reply = await self._llm.chat_completion(
                     model_key,
-                    _gate_prompt(profile, messages, threads),
+                    prompt,
                     session_id=f"{profile.bot_id}:{latest.group_id}:gate" if latest else None,
                     temperature=0.1,
                     max_tokens=160,
                     response_format={"type": "json_object"},
                 )
-            decision = _parse_decision(reply.content)
+            decision = _parse_decision(reply.content, allow_tools=bool(tool_catalog))
         except Exception as exc:  # noqa: BLE001 - Gate adapter and parse failures follow the configured fallback.
             _log.warning("model_gate_failed", bot_id=profile.bot_id, error_type=type(exc).__name__)
             decision = (
@@ -125,5 +153,8 @@ class ModelGate(GateHook):
                 if profile.gate.fail_open
                 else GateDecision(action=GateAction.SILENT, reason="gate_fallback_closed")
             )
+        if direct is not None:
+            direct.need_tools = decision.need_tools
+            decision = direct
         decision.latency_ms = int((perf_counter() - started) * 1000)
         return decision

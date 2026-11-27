@@ -5,8 +5,8 @@ from datetime import UTC, datetime
 
 import structlog
 
-from kairos.config import BotProfile
-from kairos.models import ChatMessage, ContextSummary, NormalizedMessage
+from kairos.config import BotProfile, CompactionConfig
+from kairos.models import ChatMessage, CompactionOutcome, ContextSummary, NormalizedMessage
 from kairos.protocols import ContextCompactor, LLMClient
 
 _log = structlog.get_logger()
@@ -82,6 +82,13 @@ def _merge_context(
     return ordered_summaries, uncovered
 
 
+def _uses_legacy_budget(settings: CompactionConfig) -> bool:
+    fields = settings.model_fields_set
+    return bool(fields & {"input_token_budget", "trigger_ratio", "summary_max_tokens"}) and not (
+        fields & {"trigger_tokens", "target_summary_tokens", "max_retries"}
+    )
+
+
 class DefaultContextCompactor(ContextCompactor):
     def __init__(self, llm: LLMClient, *, max_persisted_summaries: int = 3) -> None:
         if max_persisted_summaries < 1:
@@ -111,10 +118,11 @@ class DefaultContextCompactor(ContextCompactor):
             10 + estimate_tokens(f"{message.sender_alias} {message.content}")
             for message in uncovered
         )
-        return (
-            estimated > settings.input_token_budget * settings.trigger_ratio
-            or len(uncovered) >= profile.ring_buffer_size
-        )
+        if len(uncovered) >= profile.ring_buffer_size:
+            return True
+        if _uses_legacy_budget(settings):
+            return estimated > settings.input_token_budget * settings.trigger_ratio
+        return estimated >= settings.trigger_tokens
 
     async def compact(
         self,
@@ -123,20 +131,33 @@ class DefaultContextCompactor(ContextCompactor):
         messages: Sequence[NormalizedMessage],
         existing_summaries: Sequence[ContextSummary] = (),
     ) -> ContextSummary | None:
+        outcome = await self.compact_with_outcome(profile, group_id, messages, existing_summaries)
+        return outcome.summary
+
+    async def compact_with_outcome(
+        self,
+        profile: BotProfile,
+        group_id: int,
+        messages: Sequence[NormalizedMessage],
+        existing_summaries: Sequence[ContextSummary] = (),
+    ) -> CompactionOutcome:
         settings = profile.compaction
         if not settings.enabled:
-            return None
+            return CompactionOutcome(status="skipped", reason="disabled")
         summaries, uncovered = _merge_context(
             existing_summaries, messages, settings.max_persisted_summaries
         )
         to_summarize = uncovered[: -settings.keep_recent_messages]
         if not to_summarize:
-            return None
+            return CompactionOutcome(status="skipped", reason="no_old_context")
         model_key = profile.worker_model_key
         if model_key is None:
             _log.warning("context_summary_model_missing", bot_id=profile.bot_id, group_id=group_id)
-            return None
+            return CompactionOutcome(status="skipped", reason="worker_model_missing")
 
+        legacy_budget = _uses_legacy_budget(settings)
+        max_attempts = 1 if legacy_budget else settings.max_retries
+        target = settings.summary_max_tokens if legacy_budget else settings.target_summary_tokens
         history = "\n".join(
             f"截至 m{summary.covered_until_msg_id}：{summary.summary_text}" for summary in summaries
         )
@@ -144,41 +165,61 @@ class DefaultContextCompactor(ContextCompactor):
             f"[m{message.msg_id}] {message.sender_alias}：{message.content}"
             for message in to_summarize
         )
-        prompt = [
-            ChatMessage(
-                role="system",
-                content="用简洁中文总结新增群聊，保留人物、事实、未解决事项。已有摘要仅作背景。只输出摘要正文。",
-            ),
-            ChatMessage(role="user", content=f"已有摘要：\n{history}\n\n新增群聊：\n{dialogue}"),
-        ]
-        try:
-            reply = await self._llm.chat_completion(
-                model_key,
-                prompt,
-                session_id=f"{profile.bot_id}:{group_id}:summary",
-                max_tokens=settings.summary_max_tokens,
-            )
-        except Exception as exc:  # noqa: BLE001 - Any worker adapter failure skips this summary.
-            _log.warning(
-                "context_summary_failed",
+        instruction = (
+            "用简洁中文总结群聊，只保留当前仍在推进的核心事实、观点归属与未决事项。"
+            "主动丢弃无关闲聊细节，不要重复已记入长期记忆（群友画像、事件笔记）的稳定事实。"
+            f"已有摘要仅作背景。只输出摘要正文，最多 {target} tokens。"
+        )
+        source = ChatMessage(
+            role="user", content=f"已有摘要：\n{history}\n\n新增群聊：\n{dialogue}"
+        )
+        reason = ""
+        for attempt in range(1, max_attempts + 1):
+            constraint = ""
+            if attempt > 1:
+                constraint = (
+                    f"\n第 {attempt} 次尝试。严格精简：只保留关键短句和未决事项，删除所有次要内容。"
+                )
+            try:
+                reply = await self._llm.chat_completion(
+                    model_key,
+                    [ChatMessage(role="system", content=instruction + constraint), source],
+                    session_id=f"{profile.bot_id}:{group_id}:summary",
+                    max_tokens=target,
+                )
+            except Exception as exc:  # noqa: BLE001 - Worker adapter failures follow the retry policy.
+                _log.warning(
+                    "context_summary_failed",
+                    bot_id=profile.bot_id,
+                    group_id=group_id,
+                    attempt=attempt,
+                    error_type=type(exc).__name__,
+                )
+                reason = "request_failed"
+                continue
+
+            text = reply.content.strip()
+            tokens = estimate_tokens(text)
+            if not tokens or tokens > target:
+                reason = "empty_summary" if not tokens else "summary_over_target"
+                continue
+
+            tail = to_summarize[-1]
+            summary = ContextSummary(
                 bot_id=profile.bot_id,
                 group_id=group_id,
-                error_type=type(exc).__name__,
+                summary_text=text,
+                covered_until_msg_id=tail.last_msg_id,
+                covered_until_at=tail.latest_at,
+                token_estimate=tokens,
+                created_at=datetime.now(UTC),
             )
-            return None
+            return CompactionOutcome(status="succeeded", summary=summary, attempts=attempt)
 
-        text = clip_to_tokens(reply.content.strip(), settings.summary_max_tokens)
-        if not text:
-            return None
-        tail = to_summarize[-1]
-        return ContextSummary(
-            bot_id=profile.bot_id,
-            group_id=group_id,
-            summary_text=text,
-            covered_until_msg_id=tail.last_msg_id,
-            covered_until_at=tail.latest_at,
-            token_estimate=estimate_tokens(text),
-            created_at=datetime.now(UTC),
+        return CompactionOutcome(
+            status="skipped" if legacy_budget else "reset_required",
+            attempts=max_attempts,
+            reason=reason,
         )
 
     def merge_restored_context(
