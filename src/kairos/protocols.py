@@ -1,7 +1,7 @@
 """Interfaces shared across independently implemented modules."""
 
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from kairos.config import BotProfile
 from kairos.models import (
@@ -78,6 +78,7 @@ class LLMClient(Protocol):
     ) -> LLMResult: ...
 
 
+@runtime_checkable
 class GateHook(Protocol):
     async def evaluate(
         self,

@@ -13,6 +13,7 @@ from structlog.testing import capture_logs
 
 from kairos import main as entry_point
 from kairos.config import BotProfile, DebounceConfig, GlobalConfig, PostgresConfig, RateLimitConfig
+from kairos.gateway.onebot_ws import OneBotSendError
 from kairos.llm import LLMRequestError
 from kairos.main import MultiBotManager
 from kairos.models import (
@@ -518,6 +519,44 @@ async def test_gate_pass_keeps_the_main_models_action_choice(
         case.sender.set_msg_emoji_like.assert_awaited_once_with(1, "10", "76")
     else:
         case.sender.set_msg_emoji_like.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("responses", "expected_outcome"),
+    [
+        (
+            [_result('{"action":"react","candidate_target":"m10","emoji_id":"76"}')],
+            "GATE_REACT_FAILED",
+        ),
+        (
+            [
+                _result('{"action":"pass","candidate_target":"m10","reason":"可参与"}'),
+                _result("<|act:react:m10:76|>"),
+            ],
+            "MAIN_REACT_FAILED",
+        ),
+    ],
+)
+async def test_failed_reaction_records_audit_without_group_error_notice(
+    make_case, responses: list[LLMResult], expected_outcome: str
+) -> None:
+    case = make_case([_gated_profile()])
+    case.llm.chat_completion.side_effect = responses
+    case.sender.set_msg_emoji_like.side_effect = OneBotSendError("unsupported emoji")
+    with capture_logs() as logs:
+        await case.manager.handle_group_event(_event("10"))
+        audit = await case.next_audit()
+        await case.manager.shutdown()
+
+    assert (audit.action_type, audit.stale_action, audit.target_msg_id, audit.emoji_id) == (
+        "react",
+        expected_outcome,
+        "10",
+        "76",
+    )
+    case.sender.send_group_msg.assert_not_awaited()
+    assert case.manager.runtimes[1].sessions[_GROUP].energy == 100
+    assert any(log["event"] == "group_reaction_failed" for log in logs)
 
 
 async def test_compacted_session_preserves_newer_same_timestamp_rows_after_warmup(

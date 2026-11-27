@@ -201,6 +201,32 @@ async def test_notes_are_extracted_on_threshold_and_invalid_output_is_ignored() 
     await worker.shutdown()
 
 
+async def test_notes_extraction_tolerates_markdown_fenced_json() -> None:
+    store = AsyncMock(spec=MemoryStore)
+    llm = AsyncMock(spec=LLMClient)
+    payload = {
+        "impressions": [{"user_qq": 20, "impression_summary": "喜欢做饭"}],
+        "notes": [
+            {"summary_text": "聊到番茄炒蛋做法", "entity_qqs": [20], "keywords": ["番茄炒蛋"]}
+        ],
+    }
+    llm.chat_completion.return_value = LLMResult(
+        content=f"提取结果如下：\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```\n完毕",
+        model="worker",
+        latency_ms=1,
+        prompt_tokens=None,
+        completion_tokens=None,
+    )
+    worker = AsyncMemoryWorker(memory_store=store, llm=llm)
+    profile = _profile(worker_key="worker")
+    worker.on_messages_updated(profile, 10, [_message(1), _message(2)])
+    await _finish_work(worker)
+
+    store.upsert_user_impression.assert_awaited_once()
+    store.save_memory_note.assert_awaited_once()
+    await worker.shutdown()
+
+
 async def test_shutdown_cancels_active_and_queued_work() -> None:
     provider = AsyncMock(spec=MemoryProvider)
     started, stopped = asyncio.Event(), asyncio.Event()

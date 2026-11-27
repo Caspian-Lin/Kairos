@@ -85,10 +85,19 @@ _INSERT_NOTE = """
 _RECALL_NOTES = """
     WITH matches AS (
         SELECT id, (keywords && $3::text[])::int
-                   + CASE WHEN $4::text <> '' THEN similarity(summary_text, $4) ELSE 0 END AS score
+                   + CASE
+                         WHEN $4::text <> '' THEN GREATEST(
+                             similarity(summary_text, $4),
+                             word_similarity(summary_text, $4)
+                         )
+                         ELSE 0
+                     END AS score
         FROM memory_notes
         WHERE bot_id = $1 AND scope_group_id = $2
-          AND (keywords && $3::text[] OR ($4 <> '' AND summary_text % $4))
+          AND (
+              keywords && $3::text[]
+              OR ($4 <> '' AND (summary_text % $4 OR summary_text <% $4))
+          )
         ORDER BY score DESC, importance DESC, created_at DESC, id DESC
         LIMIT $5
     ), recalled AS (

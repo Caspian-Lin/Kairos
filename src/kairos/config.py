@@ -79,7 +79,9 @@ class LLMModelConfig(_ConfigModel):
 
     @property
     def request_format(self) -> LLMAPIFormat:
-        return self.api_format or next(iter(_LLM_PRESETS[self.provider]))
+        if self.api_format is not None:
+            return self.api_format
+        return next(iter(_LLM_PRESETS[self.provider]))
 
     @property
     def endpoint_base_url(self) -> str:

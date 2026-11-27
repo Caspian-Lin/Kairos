@@ -39,3 +39,7 @@ exclude = ["docs/Kairos_设计文档/**"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = ["pg: requires a PostgreSQL test database"]
+
+[[tool.mypy.overrides]]
+module = ["asyncpg", "asyncpg.*", "yaml", "yaml.*"]
+ignore_missing_imports = true

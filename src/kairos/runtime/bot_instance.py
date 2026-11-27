@@ -312,7 +312,7 @@ class BotRuntime:
         )
         gate_decision: GateDecision | None = None
         hook = session.gate_hook
-        if self.profile.gate.enabled and hasattr(hook, "evaluate"):
+        if self.profile.gate.enabled and isinstance(hook, GateHook):
             gate_decision = await hook.evaluate(
                 self.profile, history, threads, latest_msg=trigger_message
             )
@@ -334,7 +334,7 @@ class BotRuntime:
                 )
                 await self._react(session, reaction, targets, audit, received_at, "GATE_REACT")
                 return
-        elif callable(hook) and not hasattr(hook, "evaluate"):
+        elif callable(hook) and not isinstance(hook, GateHook):
             hook_allowed = bool(await hook(self.profile, history))
             audit.gate_output["hook_allowed"] = hook_allowed
             if not hook_allowed:
@@ -470,6 +470,17 @@ class BotRuntime:
             await self._sender.set_msg_emoji_like(
                 self.profile.self_id, action.target_msg_id, action.emoji_id
             )
+        except OneBotSendError as exc:
+            _log.warning(
+                "group_reaction_failed",
+                bot_id=self.profile.bot_id,
+                group_id=session.group_id,
+                source=source,
+                target_msg_id=action.target_msg_id,
+                emoji_id=action.emoji_id,
+                error_type=type(exc).__name__,
+            )
+        else:
             session.consume_energy(self.profile.gate.energy_cost_react)
             audit.stale_action = source
         finally:

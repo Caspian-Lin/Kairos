@@ -25,7 +25,8 @@ def _gate_prompt(
         f"群聊初筛。人设：{persona}\n"
         '只输出 JSON，如 {"action":"pass","candidate_target":"m108",'
         '"emoji_id":null,"reason":"简短理由"}。'
-        '动作可选 pass、silent、react。无目标或表情用 null，贴表情时填 ID（如 "76"）。'
+        "动作可选 pass、silent、react。无目标或表情用 null，"
+        "贴表情时填 QQ 表情 ID（常用：76赞、66爱心、13呲牙、79胜利、63玫瑰）。"
     )
     board = " ".join(
         f"m{thread.latest_msg_id[:16]}({thread.message_count})" for thread in threads[:4]

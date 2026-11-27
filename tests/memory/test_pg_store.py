@@ -259,6 +259,7 @@ async def test_save_and_recall_notes(store_and_pool: tuple[PgStore, AsyncMock]) 
     query, *params = pool.fetch.await_args.args
     assert "WHERE bot_id = $1 AND scope_group_id = $2" in query
     assert "keywords && $3::text[]" in query and "summary_text % $4" in query
+    assert "summary_text <% $4" in query and "word_similarity(summary_text, $4)" in query
     assert "UPDATE memory_notes" in query and "LIMIT $5" in query
     assert params == ["bot", 200, ["cooking"], "garlic", 1]
 
@@ -434,7 +435,14 @@ async def test_real_postgres_m2_storage_and_isolation() -> None:
             for item in (note, unrelated, _note(other_bot)):
                 await store.save_memory_note(item)
             await store.save_memory_note(note.model_copy(update={"scope_group_id": 201}))
-            for keywords, query in ((["cooking"], ""), ([], "mushroom risotto garlic")):
+            for keywords, query in (
+                (["cooking"], ""),
+                ([], "mushroom risotto garlic"),
+                (
+                    [],
+                    "random chat earlier today about cooking mushroom risotto with garlic and dinner",
+                ),
+            ):
                 (match,) = await store.recall_memory_notes(bot_id, 200, keywords, query)
                 assert match.model_dump(exclude={"last_recalled_at"}) == note.model_dump(
                     exclude={"last_recalled_at"}

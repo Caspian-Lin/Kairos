@@ -293,9 +293,7 @@ class AsyncMemoryWorker:
             max_tokens=500,
             response_format={"type": "json_object"},
         )
-        payload = json.loads(result.content[:8192])
-        if not isinstance(payload, dict):
-            raise TypeError("Expected a memory object")
+        payload = _parse_json_object(result.content[:8192])
         now = datetime.now(UTC)
         for row in _rows(payload.get("impressions"), len(nicknames)):
             try:
@@ -356,6 +354,27 @@ def _recent_summaries(summaries: Sequence[ContextSummary], limit: int) -> list[C
     return sorted(
         unique.values(), key=lambda summary: (summary.covered_until_at, summary.created_at)
     )[-limit:]
+
+
+def _parse_json_object(content: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    first_object: dict[str, Any] | None = None
+    index = 0
+    while (start := content.find("{", index)) != -1:
+        try:
+            data, _ = decoder.raw_decode(content, start)
+        except ValueError:
+            index = start + 1
+            continue
+        if isinstance(data, dict):
+            if "impressions" in data or "notes" in data:
+                return data
+            if first_object is None:
+                first_object = data
+        index = start + 1
+    if first_object is not None:
+        return first_object
+    raise ValueError("Expected a JSON object from memory extraction")
 
 
 def _rows(value: object, limit: int) -> list[dict[str, Any]]:

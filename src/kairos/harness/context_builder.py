@@ -61,7 +61,10 @@ class ContextBuilder:
             "回复时直接用第一人称写要发到群里的正文。按话题决定篇幅，开头省略 [mID]、[-Xs]、[我] 等标签。"
         )
         if enable_react:
-            prompt += "\n若适合贴表情，仅输出 <|act:react:mID:emoji_id|>，使用群聊中的消息 ID。"
+            prompt += (
+                "\n若适合贴表情，仅输出 <|act:react:mID:emoji_id|>，使用群聊中的消息 ID"
+                "（常用表情 ID：76赞、66爱心、13呲牙、79胜利、63玫瑰）。"
+            )
         if gate_decision is not None and (gate_decision.candidate_target or gate_decision.reason):
             target = (
                 f"m{gate_decision.candidate_target}" if gate_decision.candidate_target else "无"
