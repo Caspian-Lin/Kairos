@@ -2,12 +2,14 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from kairos.config import BotProfile, DebounceConfig
-from kairos.models import NormalizedMessage, RawGroupEvent
+from kairos.harness.compactor import DefaultContextCompactor
+from kairos.models import ContextSummary, NormalizedMessage, RawGroupEvent
+from kairos.protocols import LLMClient
 from kairos.runtime import group_session
 from kairos.runtime.group_session import GroupSession
 
@@ -139,6 +141,73 @@ def test_l1a_caps_peer_turns_until_human_message(session: GroupSession) -> None:
     assert session.consecutive_peer_bot_turns == 0
     peer_after_human = _ingest(session, 5, "继续", _PEER)
     assert session.evaluate_l1a_gate(peer_after_human, 105) == (True, "pass")
+
+
+def test_l1a_energy_recovers_lazily_and_direct_address_bypasses_exhaustion(
+    session: GroupSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 100.0
+    monkeypatch.setattr(group_session, "monotonic", lambda: now)
+    profile = session.profile.model_copy(deep=True)
+    profile.gate.enabled = True
+    profile.gate.energy_max = 30
+    profile.gate.energy_recover_per_min = 6
+    group = GroupSession(profile, _GROUP)
+    plain = _ingest(group, 1, "群聊")
+    mention = plain.model_copy(update={"is_at_bot": True})
+
+    assert group.energy == 30
+    group.consume_energy(profile.gate.energy_cost_reply)
+    group.consume_energy(profile.gate.energy_cost_react)
+    assert group.energy == 0
+    assert group.evaluate_l1a_gate(plain, now) == (False, "low_energy")
+    assert group.evaluate_l1a_gate(mention, now) == (True, "pass")
+    now += 60
+    assert group.evaluate_l1a_gate(plain, now) == (True, "pass")
+    assert group.energy == 6
+    now += 360
+    assert group.evaluate_l1a_gate(plain, now) == (True, "pass")
+    assert group.energy == 30
+
+
+def test_warmup_replays_only_uncovered_messages_and_tracks_threads(session: GroupSession) -> None:
+    profile = session.profile.model_copy(deep=True)
+    profile.compaction.enabled = True
+    source = GroupSession(profile, _GROUP)
+    older = _ingest(source, 1, "已覆盖")
+    covered_bot = source.record_bot_message("2", "已覆盖的回复", _NOW + timedelta(seconds=2))
+    tail = _ingest(source, 3, "需要回放")
+    later = _ingest(source, 4, "继续")
+
+    def summary(message: NormalizedMessage) -> ContextSummary:
+        return ContextSummary(
+            bot_id=profile.bot_id,
+            group_id=_GROUP,
+            summary_text=message.content,
+            covered_until_msg_id=message.last_msg_id,
+            covered_until_at=message.latest_at,
+            created_at=message.latest_at,
+            token_estimate=6,
+        )
+
+    first, second = summary(older), summary(covered_bot)
+    unrelated = summary(later).model_copy(update={"group_id": _GROUP + 1})
+    group = GroupSession(profile, _GROUP)
+    group.warmup(
+        [later, tail, covered_bot, older, tail],
+        [second, unrelated, first],
+        compactor=DefaultContextCompactor(AsyncMock(spec=LLMClient)),
+    )
+    assert group.summaries == [first, second]
+    assert [message.content for message in group.buffer] == ["需要回放 / 继续"]
+    assert list(group.bot_msg_ids) == ["2"]
+    assert group.seq == 2
+    reply = _ingest(group, 5, "[CQ:reply,id=2]好的")
+    assert reply.is_reply_to_bot
+    recorded = group.record_bot_message("6", "新回复", _NOW + timedelta(seconds=6), "5")
+    assert group.thread_tracker is not None
+    (thread,) = group.thread_tracker.active_threads(recorded.latest_at)
+    assert (thread.root_msg_id, thread.latest_msg_id, thread.message_count) == ("3", "6", 4)
 
 
 @pytest.mark.parametrize("direct_flag", ["is_at_bot", "is_reply_to_bot", "mentions_bot_name"])

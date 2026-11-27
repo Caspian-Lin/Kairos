@@ -12,12 +12,14 @@ import structlog
 
 from kairos.config import BotProfile
 from kairos.harness.normalizer import MessageNormalizer, UidAliasTable, coalesce_message
-from kairos.models import NormalizedMessage, RawGroupEvent
-from kairos.protocols import GateHook
+from kairos.harness.thread_tracker import ThreadTracker
+from kairos.models import ContextSummary, NormalizedMessage, RawGroupEvent
+from kairos.protocols import ContextCompactor, GateHook
 
 _log = structlog.get_logger(__name__)
 
 type TriggerCallback = Callable[[NormalizedMessage], Awaitable[None]]
+type RuntimeGateHook = Callable[[BotProfile, Sequence[NormalizedMessage]], Awaitable[bool]]
 
 
 @dataclass(slots=True)
@@ -32,12 +34,22 @@ class GroupSession:
     """Buffer group messages and debounce the serialized pipeline callbacks."""
 
     def __init__(
-        self, profile: BotProfile, group_id: int, gate_hook: GateHook | None = None
+        self,
+        profile: BotProfile,
+        group_id: int,
+        gate_hook: GateHook | RuntimeGateHook | None = None,
     ) -> None:
         self.profile = profile
         self.group_id = group_id
         self.llm_session_id = f"ses_{uuid4().hex}"
         self.gate_hook = gate_hook
+        self.m2_enabled = (
+            profile.gate.enabled or profile.compaction.enabled or profile.memory.enabled
+        )
+        self.thread_tracker = ThreadTracker() if self.m2_enabled else None
+        self.summaries: list[ContextSummary] = []
+        self.energy = profile.gate.energy_max
+        self._energy_updated_at = monotonic()
         self.buffer: deque[NormalizedMessage] = deque(maxlen=profile.ring_buffer_size)
         self.seq = 0
         self.alias_table = UidAliasTable()
@@ -53,15 +65,38 @@ class GroupSession:
         self._trigger_task: Task[None] | None = None
         self._closed = False
 
-    def warmup(self, history: Sequence[NormalizedMessage]) -> None:
+    def warmup(
+        self,
+        history: Sequence[NormalizedMessage],
+        summaries: Sequence[ContextSummary] = (),
+        *,
+        compactor: ContextCompactor | None = None,
+    ) -> None:
         """Rebuild a fresh session from persisted individual arrivals in time order."""
-        for message in history:
-            if (
-                message.bot_id != self.profile.bot_id
-                or message.group_id != self.group_id
-                or message.is_kairos_notice
-            ):
-                continue
+        scoped = [
+            message
+            for message in history
+            if message.bot_id == self.profile.bot_id
+            and message.group_id == self.group_id
+            and not message.is_kairos_notice
+        ]
+        replay = scoped
+        if summaries and compactor is not None:
+            scoped_summaries = [
+                summary
+                for summary in summaries
+                if summary.bot_id == self.profile.bot_id and summary.group_id == self.group_id
+            ]
+            self.summaries, replay = compactor.merge_restored_context(scoped_summaries, scoped)
+            # Covered messages still identify known speakers and earlier bot receipts.
+            replay_ids = {message.msg_id for message in replay}
+            for message in scoped:
+                if message.msg_id not in replay_ids:
+                    if message.is_bot:
+                        self.bot_msg_ids.append(message.msg_id)
+                    else:
+                        self.alias_table.restore_alias(message.sender_qq, message.sender_alias)
+        for message in replay:
             if not message.is_bot:
                 self.alias_table.restore_alias(message.sender_qq, message.sender_alias)
             self._append_message(message)
@@ -111,6 +146,11 @@ class GroupSession:
         """Apply group-level rules and count a peer turn on admission."""
         rate = self.profile.rate_limit
         addressed = latest_msg.addresses_bot
+        if self.profile.gate.enabled:
+            self._recover_energy(now_mono)
+            gate = self.profile.gate
+            if not addressed and self.energy < min(gate.energy_cost_reply, gate.energy_cost_react):
+                return False, "low_energy"
         if latest_msg.is_peer_bot and self.consecutive_peer_bot_turns >= rate.peer_bot_max_turns:
             return False, "peer_bot_limit"
         if (
@@ -124,6 +164,16 @@ class GroupSession:
         if latest_msg.is_peer_bot:
             self.consecutive_peer_bot_turns += 1
         return True, "pass"
+
+    def consume_energy(self, cost: float) -> None:
+        self._recover_energy(monotonic())
+        self.energy = max(0.0, self.energy - cost)
+
+    def _recover_energy(self, now_mono: float) -> None:
+        elapsed = max(0.0, now_mono - self._energy_updated_at)
+        gate = self.profile.gate
+        self.energy = min(gate.energy_max, self.energy + elapsed * gate.energy_recover_per_min / 60)
+        self._energy_updated_at = max(self._energy_updated_at, now_mono)
 
     def schedule_trigger(
         self,
@@ -172,6 +222,8 @@ class GroupSession:
             await gather(self._trigger_task, return_exceptions=True)
 
     def _append_message(self, incoming: NormalizedMessage) -> bool:
+        if self.thread_tracker is not None:
+            self.thread_tracker.observe(incoming)
         message, merged = coalesce_message(self.buffer, incoming)
         if merged:
             self.buffer[-1] = message

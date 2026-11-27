@@ -1,20 +1,30 @@
 import asyncio
+import json
 import signal
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from itertools import count
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from conftest import FakeSender, FakeStore
 from structlog.testing import capture_logs
 
 from kairos import main as entry_point
 from kairos.config import BotProfile, DebounceConfig, GlobalConfig, PostgresConfig, RateLimitConfig
 from kairos.llm import LLMRequestError
 from kairos.main import MultiBotManager
-from kairos.models import AuditRecord, LLMResult, MessageSegment, NormalizedMessage, RawGroupEvent
-from kairos.protocols import LLMClient, MessageStore, OneBotSender
+from kairos.models import (
+    AuditRecord,
+    ContextSummary,
+    LLMResult,
+    MemoryNote,
+    MessageSegment,
+    NormalizedMessage,
+    RawGroupEvent,
+)
+from kairos.protocols import LLMClient
 from kairos.runtime import bot_instance
 from kairos.telemetry.audit_logger import AuditLogger
 
@@ -105,14 +115,15 @@ def _history(msg_id: str, sender: int, alias: str, text: str) -> NormalizedMessa
 
 
 class _RuntimeCase:
-    def __init__(self, profiles: Sequence[BotProfile]) -> None:
-        self.store = Mock(spec=MessageStore)
-        self.store.load_recent_messages.return_value = []
+    def __init__(
+        self, profiles: Sequence[BotProfile], bot_clients: Mapping[str, LLMClient] | None = None
+    ) -> None:
+        self.store = FakeStore()
         self.audit_records: asyncio.Queue[AuditRecord] = asyncio.Queue()
         self.store.save_audit_log.side_effect = self.audit_records.put_nowait
         self.llm = Mock(spec=LLMClient)
         self.llm.chat_completion.return_value = _result()
-        self.sender = Mock(spec=OneBotSender)
+        self.sender = FakeSender()
         self.sends: asyncio.Queue[tuple[int, int, str, str | None]] = asyncio.Queue()
         echo_ids = count(1001)
 
@@ -124,7 +135,16 @@ class _RuntimeCase:
 
         self.sender.send_group_msg.side_effect = acknowledge
         self.audit = AuditLogger(self.store)
-        self.manager = MultiBotManager(profiles, self.store, self.llm, self.sender, self.audit)
+        self.manager = MultiBotManager(
+            profiles,
+            self.store,
+            self.llm,
+            self.sender,
+            self.audit,
+            bot_llm_clients=bot_clients,
+            summary_store=self.store,
+            memory_store=self.store,
+        )
 
     async def next_audit(self) -> AuditRecord:
         return await asyncio.wait_for(self.audit_records.get(), timeout=2)
@@ -134,8 +154,10 @@ class _RuntimeCase:
 async def make_case() -> AsyncIterator[Callable[[Sequence[BotProfile]], _RuntimeCase]]:
     async with AsyncExitStack() as resources:
 
-        def create(profiles: Sequence[BotProfile]) -> _RuntimeCase:
-            case = _RuntimeCase(profiles)
+        def create(
+            profiles: Sequence[BotProfile], bot_clients: Mapping[str, LLMClient] | None = None
+        ) -> _RuntimeCase:
+            case = _RuntimeCase(profiles, bot_clients)
             resources.push_async_callback(case.audit.drain)
             resources.push_async_callback(case.manager.shutdown)
             return case
@@ -409,6 +431,214 @@ async def test_slow_failing_audit_does_not_block_other_group_sends(make_case) ->
     assert len(warnings) == 2
     assert all(log["log_level"] == "warning" for log in warnings)
     assert "private database diagnostic" not in str(warnings)
+
+
+def _gated_profile() -> BotProfile:
+    profile = _profile()
+    profile.gate.enabled = True
+    profile.gate.energy_recover_per_min = 0
+    profile.gate_model_key = "gate"
+    return profile
+
+
+@pytest.mark.parametrize(
+    ("action", "candidate", "expected_target"),
+    [("silent", None, None), ("react", "m9", "9"), ("react", None, "10"), ("react", "m999", "10")],
+)
+async def test_model_gate_short_circuits_the_main_model_with_audit(
+    make_case, action: str, candidate: str | None, expected_target: str | None
+) -> None:
+    case = make_case([_gated_profile()])
+    case.store.load_recent_messages.return_value = [_history("9", 43, "U1", "另一条")]
+    emoji_id = "76" if action == "react" else None
+    case.llm.chat_completion.return_value = _result(
+        json.dumps(
+            {
+                "action": action,
+                "candidate_target": candidate,
+                "emoji_id": emoji_id,
+                "reason": "初筛理由",
+            }
+        )
+    )
+    await case.manager.handle_group_event(_event("10"))
+    audit = await case.next_audit()
+    await case.manager.shutdown()
+
+    assert [call.args[0] for call in case.llm.chat_completion.await_args_list] == ["gate"]
+    assert audit.stale_action == f"GATE_{action.upper()}"
+    assert audit.gate_output["action"] == audit.action_type == action
+    assert audit.gate_output["reason"] == "初筛理由"
+    assert audit.gate_output["latency_ms"] >= 0
+    assert (audit.target_msg_id, audit.emoji_id) == (expected_target, emoji_id)
+    case.sender.send_group_msg.assert_not_awaited()
+    if expected_target is None:
+        case.sender.set_msg_emoji_like.assert_not_awaited()
+    else:
+        case.sender.set_msg_emoji_like.assert_awaited_once_with(1, expected_target, emoji_id)
+    session = case.manager.runtimes[1].sessions[_GROUP]
+    assert session.energy == (100 if action == "silent" else 95)
+    assert [message.msg_id for message in session.buffer] == ["9", "10"]
+    assert [call.args[0].msg_id for call in case.store.save_message.await_args_list] == ["10"]
+
+
+@pytest.mark.parametrize(
+    ("answer", "action", "outcome", "remaining", "target"),
+    [
+        (_REPLY, "reply", "SEND_DIRECT", 75, None),
+        ("<|act:silent|>", "silent", "VETOED", 100, None),
+        ("<|act:react:m10:76|>", "react", "MAIN_REACT", 95, "10"),
+        ("<|act:react:m999:76|>", "react", "MAIN_REACT_INVALID", 100, "999"),
+    ],
+)
+async def test_gate_pass_keeps_the_main_models_action_choice(
+    make_case, answer: str, action: str, outcome: str, remaining: float, target: str | None
+) -> None:
+    case = make_case([_gated_profile()])
+    case.llm.chat_completion.side_effect = [
+        _result('{"action":"pass","candidate_target":"m10","reason":"可参与"}'),
+        _result(answer),
+    ]
+    await case.manager.handle_group_event(_event("10"))
+    audit = await case.next_audit()
+    await case.manager.shutdown()
+
+    calls = case.llm.chat_completion.await_args_list
+    assert [call.args[0] for call in calls] == ["gate", "first-model"]
+    prompt = calls[1].args[1][0].content
+    assert "初筛建议目标 m10" in prompt and "仅供参考" in prompt
+    assert "<|act:react:mID:emoji_id|>" in prompt and "活跃线程板" in prompt
+    assert (audit.action_type, audit.stale_action, audit.target_msg_id) == (action, outcome, target)
+    assert audit.main_vetoed is (action == "silent")
+    session = case.manager.runtimes[1].sessions[_GROUP]
+    assert session.energy == remaining
+    ids = [call.args[0].msg_id for call in case.store.save_message.await_args_list]
+    assert ids == (["10", "1001"] if action == "reply" else ["10"])
+    if outcome == "MAIN_REACT":
+        case.sender.set_msg_emoji_like.assert_awaited_once_with(1, "10", "76")
+    else:
+        case.sender.set_msg_emoji_like.assert_not_awaited()
+
+
+async def test_compacted_session_preserves_newer_same_timestamp_rows_after_warmup(
+    make_case,
+) -> None:
+    profile = _profile()
+    profile.compaction.enabled = True
+    case = make_case([profile])
+    earlier = _history("42", 43, "U1", "已被覆盖的原文")
+    later = _history("5", 44, "U2", "同一秒续接的原文")
+    summary = ContextSummary(
+        bot_id=profile.bot_id,
+        group_id=_GROUP,
+        summary_text="恢复的持久化摘要",
+        covered_until_msg_id="42",
+        covered_until_at=earlier.latest_at,
+        created_at=_TIME,
+        token_estimate=10,
+    )
+    case.store.load_recent_messages.return_value = [earlier, later]
+    case.store.load_recent_summaries.return_value = [summary]
+    await case.manager.handle_group_event(_event("10"))
+    audit = await case.next_audit()
+    await case.manager.shutdown()
+
+    system, user = [turn["content"] for turn in audit.context_snapshot]
+    assert "恢复的持久化摘要" in system
+    assert "同一秒续接的原文" in user and "已被覆盖的原文" not in user
+    assert case.manager.runtimes[1].sessions[_GROUP].summaries == [summary]
+    case.store.load_recent_summaries.assert_awaited_once_with(profile.bot_id, _GROUP, limit=3)
+
+
+async def test_main_uses_hot_memory_while_recall_is_blocked(make_case) -> None:
+    profile = _profile()
+    profile.trigger_mode = "mention_only"
+    profile.memory.enabled = True
+    profile.memory.warm_trigger_messages = 1
+    case = make_case([profile])
+    note = MemoryNote(
+        bot_id=profile.bot_id,
+        scope_group_id=_GROUP,
+        entity_qqs=[42],
+        summary_text="上周约好周五见",
+        keywords=["周五"],
+        created_at=_TIME,
+    )
+    case.store.recall_memory_notes.return_value = [note]
+    await case.manager.handle_group_event(_event("10"))
+    worker = case.manager.memory_worker
+    assert worker is not None
+    async with asyncio.timeout(1):
+        while not worker.get_warm_memory(profile.bot_id, _GROUP).notes:
+            await asyncio.sleep(0)
+
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def blocking_recall(*_args: object) -> list[MemoryNote]:
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+        return []
+
+    case.store.recall_memory_notes.side_effect = blocking_recall
+    await case.manager.handle_group_event(_event("11", sender=43, mention=True))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    audit = await case.next_audit()
+    assert audit.final_reply == _REPLY
+    assert "上周约好周五见" in audit.context_snapshot[0]["content"]
+    assert not cancelled.is_set()
+    await case.manager.shutdown()
+    assert cancelled.is_set()
+
+
+async def test_shared_memory_worker_uses_each_bots_own_llm_client(make_case) -> None:
+    first, second = _profile(), _profile("second", 2)
+    for profile in (first, second):
+        profile.trigger_mode = "mention_only"
+        profile.memory.enabled = True
+        profile.memory.note_extract_interval_messages = 1
+        profile.worker_model_key = "worker"
+    clients = {profile.bot_id: Mock(spec=LLMClient) for profile in (first, second)}
+    for bot_id, client in clients.items():
+        client.chat_completion.return_value = _result(
+            json.dumps(
+                {"notes": [{"summary_text": bot_id, "entity_qqs": [42], "keywords": ["test"]}]}
+            )
+        )
+    case = make_case([first, second], clients)
+    await case.manager.handle_group_event(_event("10"))
+    await case.manager.handle_group_event(_event("11", self_id=2))
+    async with asyncio.timeout(1):
+        while case.store.save_memory_note.await_count < 2:
+            await asyncio.sleep(0)
+    for bot_id, client in clients.items():
+        client.chat_completion.assert_awaited_once()
+        assert client.chat_completion.await_args.kwargs["session_id"] == f"{bot_id}:{_GROUP}:memory"
+    assert {
+        call.args[0].bot_id: call.args[0].summary_text
+        for call in case.store.save_memory_note.await_args_list
+    } == {
+        first.bot_id: first.bot_id,
+        second.bot_id: second.bot_id,
+    }
+
+
+async def test_m1_uses_only_existing_calls_and_preserves_literal_action_text(make_case) -> None:
+    case = make_case([_profile()])
+    marker = "<|act:react:10:76|>"
+    case.llm.chat_completion.return_value = _result(marker)
+    await case.manager.handle_group_event(_event("10"))
+    audit = await case.next_audit()
+    assert case.manager.memory_worker is None
+    assert audit.final_reply == marker and audit.action_type is None
+    case.llm.chat_completion.assert_awaited_once()
+    case.store.load_recent_messages.assert_awaited_once()
+    case.store.load_recent_summaries.assert_not_awaited()
+    case.store.recall_memory_notes.assert_not_awaited()
+    case.store.load_user_impressions.assert_not_awaited()
+    case.sender.set_msg_emoji_like.assert_not_awaited()
 
 
 @pytest.mark.parametrize("start_fails", [False, True])
