@@ -1,6 +1,6 @@
 # Kairos（知时）
 
-Kairos 在一个 Python 进程内托管 1–3 个 QQ Bot，通过 OneBot v11 反向 WebSocket 接收群消息。它使用 PostgreSQL 保存群消息和决策审计，并按每个 Bot 的模型配置生成回复。 [当前进度与交接](docs/HANDOFF.md) · [Stage 1 实现规划](docs/Kairos_设计文档/02_Kairos_Stage1_技术栈与2C4G工程实现规划.md)
+Kairos 在一个 Python 进程内托管 1–3 个 QQ Bot，通过 OneBot v11 反向 WebSocket 接收群消息。它使用 PostgreSQL 保存群消息和决策审计，并按每个 Bot 的模型配置生成回复。Stage 1-B（M2）支持可选的双级门控、贴表情、滚动摘要和免 Embedding 群聊记忆。 [当前进度与交接](docs/HANDOFF.md) · [Stage 1 实现规划](docs/Kairos_设计文档/02_Kairos_Stage1_技术栈与2C4G工程实现规划.md)
 
 ## 在 WSL2 本地运行
 
@@ -25,6 +25,13 @@ sudo -u postgres createdb --owner=kairos kairos
 ```
 
 在 2C4G 机器上将 [postgres_2c4g.conf](deploy/postgres_2c4g.conf) 纳入当前集群的 `postgresql.conf`。Ubuntu PostgreSQL 16 的默认集群可将该文件放入 `/etc/postgresql/16/main/conf.d/`。先用 `sudo -u postgres psql -Atc 'SHOW config_file'` 确认实际路径及 `include_dir`，安装后重启该集群以加载内存和连接数参数。
+
+数据库迁移 `0001_m1_core_tables` 创建 `group_messages` 和 `decision_audit_logs`。`0002_m2_memory_and_summaries` 启用 `pg_trgm`，创建 `context_summaries`、`user_impressions` 和 `memory_notes`，并给审计表增加 `action_type`、`target_msg_id`、`emoji_id`。用应用数据库的所有者执行迁移。已有 M1 库通过 `alembic upgrade head` 升级，群消息和既有审计记录会保留。 [M2 迁移脚本](alembic/versions/0002_m2_memory_and_summaries.py)
+
+```sh
+uv run --env-file .env alembic upgrade head
+uv run --env-file .env alembic current
+```
 
 ### 配置和启动
 
@@ -77,7 +84,7 @@ allowed_groups:
 make dev
 ```
 
-`make dev` 从 `.env` 和 `config/global.yaml` 读取配置，连接已运行的原生 PostgreSQL，执行 `alembic upgrade head` 并启动 Kairos。迁移创建 `group_messages` 和 `decision_audit_logs`。OneBot 端口就绪后，`make dev` 复用已运行的 NapCat，或用 Xvfb 启动 `~/Napcat/opt/QQ/qq`。安装路径不同可用 `NAPCAT_QQ=/path/to/qq make dev`。按 Ctrl+C 会停止这次由 `make dev` 启动的进程。
+`make dev` 从 `.env` 和 `config/global.yaml` 读取配置，连接已运行的原生 PostgreSQL，执行 `alembic upgrade head` 并启动 Kairos。OneBot 端口就绪后，`make dev` 复用已运行的 NapCat，或用 Xvfb 启动 `~/Napcat/opt/QQ/qq`。安装路径不同可用 `NAPCAT_QQ=/path/to/qq make dev`。按 Ctrl+C 会停止这次由 `make dev` 启动的进程。
 
 使用 `make launcher` 打开 WSLg 桌面启动管理器。窗口可分别启动或停止两个服务，并显示运行日志。关闭窗口会停止由它启动的进程。桌面入口使用系统 Python、`python3-gi` 和 `gir1.2-gtk-3.0`。终端里可用 `make kairos` 或 `make napcat` 单独启动服务。
 
@@ -120,25 +127,67 @@ Kairos 的反向监听端口写在 `config/global.yaml` 的 `onebot_ws.port`，�
 
 ### 聊天触发、上下文与调试
 
-白名单群里的直接 `@`、引用 Bot 聊天回复、或普通文本包含该 Bot 的 `nickname` 都能触发模型。名字匹配忽略大小写。短时间的多个触发会合并处理，群聊插话仍会进入上下文。规则由代码定义，已有的 `trigger_mode` 仅用于兼容旧配置。
+白名单群里的直接 `@`、引用 Bot 聊天回复、或普通文本包含该 Bot 的 `nickname` 都能触发模型。名字匹配忽略大小写。短时间的多个触发会合并处理，群聊插话仍会进入上下文。可用 `trigger_mode: all_with_veto` 让普通群聊也进入门控和回复判断。
 
-每个 Bot 在每个群独立维护默认 40 个上下文消息块。首次收到消息时先从 PostgreSQL 读取本 Bot 在该群的最近 40 条，随后合并同一群友在 10 秒内的相邻连发，并淘汰窗口里最早的块。原始消息逐条保存。请求以人设和最近窗口构建上下文，当前采用按条数淘汰，摘要压缩和输入 token 裁剪留待实现。可在 Bot YAML 中用 `ring_buffer_size` 设置窗口。
+每个 Bot 在每个群独立维护默认 40 个上下文消息块。首次收到消息时从 PostgreSQL 读取最近的原始消息，随后合并同一群友在 10 秒内的相邻连发，并淘汰窗口里最早的块。原始消息逐条保存，窗口大小由 Bot YAML 的 `ring_buffer_size` 控制。启用压缩后，历史摘要先进入系统提示，摘要覆盖范围之后的原始消息按时间续接，聊天输入按估算 token 数裁剪。
 
 模型直接生成聊天正文，整条输出为 `<|act:silent|>` 时表示沉默。通过过期和重复检查后，Kairos 把正文作为一条消息发送并写入聊天历史。Gemini 在普通群和调试群统一使用配置里的 `thinking_level: minimal`。Gemini 和 OpenAI 兼容接口默认使用服务端的输出限制。Anthropic Messages 接口要求填写 `max_tokens`，适配器在未配置时填入 4096。
 
-`debug_groups` 可逐行添加需要联调的白名单群号。模型在调试群选择沉默时，Kairos 引用触发消息发送「这条触发成功但是模型选择沉默」。处理群消息出错时，各白名单群都能收到错误类型和可用的 HTTP 状态码。系统提示与聊天历史分开处理。
+`debug_groups` 可逐行添加需要联调的白名单群号。主模型在调试群选择沉默时，Kairos 引用触发消息发送「这条触发成功但是模型选择沉默」。处理群消息出错时，各白名单群都能收到错误类型和可用的 HTTP 状态码。系统提示与聊天历史分开处理。
+
+### M2 可选配置
+
+`gate`、`compaction`、`memory` 分别按 Bot 开启，默认均关闭。把下列字段加到该 Bot 的 YAML。示例复用现有 `llm.chat`，也可以在 `llm` 中新增不同的门控和后台模型槽，再把相应键写入 `gate_model_key`、`worker_model_key`。启用 `gate` 时必须配置 `gate_model_key`。后台生成摘要和提炼事件笔记使用 `worker_model_key`，已有记忆的召回可以独立启用。 [Bot 配置示例](config/examples/bots/1.yaml)
+
+```yaml
+trigger_mode: all_with_veto
+gate_model_key: chat
+worker_model_key: chat
+gate:
+  enabled: true
+  persona_card: 爱聊做饭，接得上话题才发言。
+  recent_messages_limit: 12
+  timeout_seconds: 1.5
+  fail_open: false
+  energy_max: 100.0
+  energy_recover_per_min: 5.0
+  energy_cost_reply: 25.0
+  energy_cost_react: 5.0
+compaction:
+  enabled: true
+  input_token_budget: 4096
+  trigger_ratio: 0.75
+  keep_recent_messages: 16
+  summary_max_tokens: 300
+  max_persisted_summaries: 3
+memory:
+  enabled: true
+  warm_trigger_messages: 6
+  max_notes_recalled: 5
+  max_impressions_recalled: 10
+  note_extract_interval_messages: 12
+```
+
+- `gate` 按群维护精力值，并把短人设卡（最多 200 字）、近期消息和线程板发给轻量模型。模型可以放行、沉默或贴表情。直接 `@` 或引用 Bot 聊天回复可绕过精力值与模型初筛。门控请求超时或输出无效时由 `fail_open` 决定是否放行。
+- 主模型可以回复、输出 `<|act:silent|>`，或用 `<|act:react:m123:76|>` 调用 NapCat 的 `set_msg_emoji_like`。贴表情的目标消息和表情 ID 记录在决策审计中。
+- `compaction` 在估算输入超过预算比例或旧消息即将被窗口淘汰时，安排后台模型总结较早的消息。首次进入会话时加载最近摘要，按水位线恢复后续原始消息。`input_token_budget` 最少为 512。
+- `memory` 按消息量异步预热群友画像和相关事件笔记。主聊天流程直接读取进程内的有界热缓存。画像、笔记和摘要均按 Bot 与群隔离，事件笔记用关键词和 `pg_trgm` 召回。
 
 ## 测试和内存压测
 
 ```sh
 uv run ruff check .
 uv run ruff format --check .
-uv run pytest
+uv run pytest -q -rs
 uv run pytest tests/integration/test_e2e_pipeline.py
 uv run python scripts/bench_memory.py
 ```
 
-端到端回放用本地 WebSocket 模拟 NapCat，用本地 HTTP 模拟模型接口。它覆盖两个 Bot 分别通过 Gemini 和 Chat Completions 使用各自密钥，也覆盖同人连发、角色分离、`@` 快路径、过期处理、Veto 和双 Bot 防互刷。压测在 3 个 Bot、每个 10 个活跃群上回放 5,000 条消息，检查每群缓冲区有界和 Kairos Core RSS 小于 180 MB。
+端到端回放用本地 WebSocket 模拟 NapCat，用本地 HTTP 模拟模型接口。M1 场景覆盖独立模型配置、角色分离、过期回复和双 Bot 防互刷。M2 场景覆盖初筛沉默、Gate 与主模型贴表情及回执、主模型 Veto、摘要重启恢复、慢查询期间使用热记忆、精力耗尽后直接 `@` 回复。
+
+内存压测开启门控、线程追踪、热记忆和滚动摘要，在 3 个 Bot、每个 10 个活跃群上回放 5,000 条消息。脚本检查每群缓冲区、线程表、摘要和热缓存的容量，并要求 Kairos Core 的稳态 RSS 小于 180 MB。
+
+2026-11-27 验收时，独立 PostgreSQL 16 库上的全量测试通过 280 项，其中 19 项是本地协议回放。绑定两颗逻辑 CPU、cgroup 内存上限为 4 GiB 时，压测稳态 RSS 为 **68.17 MB**，完成 510 次门控、480 次摘要写入和 240 次笔记写入。每群最多 40 个消息块、20 个线程和 3 条热摘要，共预热 30 个群会话。 [压测脚本](scripts/bench_memory.py)
 
 可选 PostgreSQL 用例使用独立测试库。先设置 `KAIROS_TEST_PG_DSN`，再迁移并测试该数据库。
 
