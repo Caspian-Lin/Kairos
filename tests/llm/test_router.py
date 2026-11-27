@@ -10,7 +10,7 @@ from hpack import Encoder
 
 from kairos.config import LLMAPIFormat, LLMModelConfig, LLMProvider
 from kairos.llm import LLMConfigError, LLMRequestError, LLMResponseError, LLMRouter, router
-from kairos.models import ChatMessage
+from kairos.models import ChatMessage, ToolCall, ToolDefinition
 
 _API_KEY = "dummy-test-secret"
 _MESSAGES = [
@@ -522,3 +522,156 @@ async def test_cancellation_releases_the_model_slot(make_router: RouterFactory) 
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert (await client.chat_completion("chat_model", _MESSAGES)).content == "在呢"
+
+
+@pytest.mark.parametrize(
+    ("provider", "api_format"),
+    [
+        ("openai", "openai_chat_completions"),
+        ("openai", "openai_responses"),
+        ("anthropic", "anthropic_messages"),
+        ("google_ai_studio", "gemini_generate_content"),
+    ],
+)
+async def test_tool_only_responses_and_native_tool_schema(
+    make_router: RouterFactory, provider: LLMProvider, api_format: LLMAPIFormat
+) -> None:
+    name = "group_status"
+    parameters = {
+        "type": "object",
+        "properties": {"topic": {"type": "string"}},
+        "required": ["topic"],
+        "additionalProperties": False,
+    }
+    definition = ToolDefinition(name=name, description="Look up group state", parameters=parameters)
+    fields = {"name": name, "description": definition.description}
+    arguments = {"topic": "tea"}
+    encoded_arguments = json.dumps(arguments)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if api_format == "openai_chat_completions":
+            assert body["tools"] == [
+                {
+                    "type": "function",
+                    "function": {**fields, "parameters": parameters, "strict": True},
+                }
+            ]
+            assert body["tool_choice"] == {"type": "function", "function": {"name": name}}
+            reply = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "id": "status_call",
+                                    "function": {"name": name, "arguments": encoded_arguments},
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        elif api_format == "openai_responses":
+            assert body["tools"] == [
+                {"type": "function", **fields, "parameters": parameters, "strict": True}
+            ]
+            assert body["tool_choice"] == {"type": "function", "name": name}
+            reply = {
+                "output": [
+                    {"type": "reasoning"},
+                    {
+                        "type": "function_call",
+                        "id": "item_id",
+                        "call_id": "status_call",
+                        "name": name,
+                        "arguments": encoded_arguments,
+                    },
+                ]
+            }
+        elif api_format == "anthropic_messages":
+            assert body["tools"] == [{**fields, "input_schema": parameters}]
+            assert body["tool_choice"] == {"type": "tool", "name": name}
+            reply = {
+                "content": [
+                    {"type": "thinking", "thinking": "internal"},
+                    {"type": "tool_use", "id": "status_call", "name": name, "input": arguments},
+                ]
+            }
+        else:
+            assert body["tools"] == [
+                {"functionDeclarations": [{**fields, "parametersJsonSchema": parameters}]}
+            ]
+            assert body["toolConfig"] == {
+                "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}
+            }
+            reply = {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "functionCall": {
+                                        "id": "status_call",
+                                        "name": name,
+                                        "args": arguments,
+                                    }
+                                },
+                            ]
+                        }
+                    }
+                ]
+            }
+        return httpx.Response(200, json=reply)
+
+    configured = LLMModelConfig(
+        provider=provider, api_format=api_format, api_key=_API_KEY, model="test-model"
+    )
+    client = make_router(respond, {"chat": configured})
+    result = await client.chat_completion("chat", _MESSAGES, tools=(definition,), tool_choice=name)
+
+    assert result.content == ""
+    assert result.tool_calls == [ToolCall(id="status_call", name=name, arguments=arguments)]
+
+
+async def test_empty_tool_list_preserves_plain_request_and_response(
+    make_router: RouterFactory,
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content) == {
+            "model": _CHAT.model,
+            "messages": [message.model_dump() for message in _MESSAGES],
+            "temperature": _CHAT.request_temperature,
+        }
+        return _completion()
+
+    client = make_router(respond)
+    result = await client.chat_completion("chat_model", _MESSAGES, tools=[], tool_choice="auto")
+    assert result.content == "在呢" and result.tool_calls == []
+
+
+async def test_tool_arguments_must_be_json_objects(make_router: RouterFactory) -> None:
+    def respond(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call",
+                                    "type": "function",
+                                    "function": {"name": "status", "arguments": "[]"},
+                                },
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    with pytest.raises(LLMResponseError):
+        await make_router(respond).chat_completion("chat_model", _MESSAGES)

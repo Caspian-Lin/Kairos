@@ -163,3 +163,52 @@ async def test_gate_only_sends_recent_messages_short_persona_and_threads() -> No
     await ModelGate(llm).evaluate(profile, messages)
     assert profile.persona_prompt[:150] in llm.chat_completion.await_args.args[1][0].content
     assert profile.persona_prompt[:151] not in llm.chat_completion.await_args.args[1][0].content
+
+
+async def test_gate_includes_only_a_compact_catalog_and_parses_tool_requests() -> None:
+    profile = _profile()
+    llm = _llm('{"action":"pass","need_tools":["status","notes","status",4," "]}')
+    gate = ModelGate(llm)
+    messages = [_message(123, "查看状态。")]
+
+    unassisted = await gate.evaluate(profile, messages)
+    unassisted_prompt = llm.chat_completion.await_args.args[1][0].content
+    assisted = await gate.evaluate(profile, messages, tool_catalog="status: 查询当前状态")
+    assisted_prompt = llm.chat_completion.await_args.args[1][0].content
+
+    assert unassisted.need_tools == []
+    assert "need_tools" not in unassisted_prompt and "可用工具" not in unassisted_prompt
+    assert assisted.need_tools == ["status", "notes"]
+    assert assisted_prompt.startswith(unassisted_prompt)
+    assert "status: 查询当前状态" in assisted_prompt
+    assert "need_tools" in assisted_prompt
+    assert "tools" not in llm.chat_completion.await_args.kwargs
+
+
+@pytest.mark.parametrize(
+    ("response", "need_tools"),
+    [
+        ('{"action":"pass","need_tools":["status"]}', ["status"]),
+        ('{"action":"silent","need_tools":["status"]}', []),
+        ('{"action":"react","candidate_target":"m123","emoji_id":"76"}', []),
+        ("invalid", []),
+    ],
+)
+async def test_direct_address_with_catalog_can_route_tools_and_still_pass(
+    response: str, need_tools: list[str]
+) -> None:
+    llm = _llm(response)
+    gate = ModelGate(llm)
+    message = _message(123, "查一下状态。", is_at_bot=True)
+    decision = await gate.evaluate(
+        _profile(), [message], latest_msg=message, tool_catalog="status: 查询状态"
+    )
+
+    llm.chat_completion.assert_awaited_once()
+    assert "直接提问" in llm.chat_completion.await_args.args[1][0].content
+    assert (decision.action, decision.reason, decision.candidate_target) == (
+        GateAction.PASS,
+        "direct_address",
+        message.last_msg_id,
+    )
+    assert decision.need_tools == need_tools

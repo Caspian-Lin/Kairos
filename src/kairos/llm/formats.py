@@ -1,20 +1,25 @@
 """Translate Kairos text conversations to provider HTTP formats."""
 
-from collections.abc import Iterable
+import json
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
 from kairos.config import LLMAPIFormat, LLMModelConfig
-from kairos.models import ChatMessage, LLMResult
+from kairos.models import ChatMessage, LLMResult, ToolCall, ToolDefinition
 
 # Messages requires a numeric max_tokens even when the Bot has no configured limit.
 _ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
+_TOOL_OVERRIDES = {"tools", "tool_choice"}
 _OVERRIDES: dict[LLMAPIFormat, set[str]] = {
-    "openai_chat_completions": {"temperature", "max_tokens", "stop", "response_format"},
-    "openai_responses": {"temperature", "max_tokens", "response_format"},
-    "anthropic_messages": {"temperature", "max_tokens", "stop", "response_format"},
-    "gemini_generate_content": {"temperature", "max_tokens", "stop", "response_format"},
+    "openai_chat_completions": {"temperature", "max_tokens", "stop", "response_format"}
+    | _TOOL_OVERRIDES,
+    "openai_responses": {"temperature", "max_tokens", "response_format"} | _TOOL_OVERRIDES,
+    "anthropic_messages": {"temperature", "max_tokens", "stop", "response_format"}
+    | _TOOL_OVERRIDES,
+    "gemini_generate_content": {"temperature", "max_tokens", "stop", "response_format"}
+    | _TOOL_OVERRIDES,
 }
 
 
@@ -113,6 +118,9 @@ def build_request(
             if system:
                 body["systemInstruction"] = {"parts": [{"text": system}]}
 
+    if tools := overrides.get("tools"):
+        body.update(_tool_options(api_format, tools, overrides.get("tool_choice")))
+
     if config.provider == "anthropic":
         headers = {"x-api-key": config.api_key, "anthropic-version": "2026-10-21"}
     elif config.provider == "google_ai_studio":
@@ -122,6 +130,82 @@ def build_request(
     if config.provider == "opencode_go" and session_id is not None:
         headers.update({"user-agent": "Kairos", "x-opencode-session": session_id})
     return CompletionRequest(f"{config.endpoint_base_url.rstrip('/')}/{path}", headers, body)
+
+
+def _tool_options(api_format: LLMAPIFormat, tools: object, choice: object) -> dict[str, Any]:
+    if not isinstance(tools, Sequence) or not all(
+        isinstance(tool, ToolDefinition) for tool in tools
+    ):
+        raise ValueError("tools must be a sequence of ToolDefinition")
+    definitions: list[dict[str, Any]] = []
+    for tool in tools:
+        fields = {"name": tool.name, "description": tool.description}
+        if api_format == "openai_chat_completions":
+            definition = {
+                "type": "function",
+                "function": {
+                    **fields,
+                    "parameters": tool.parameters,
+                    "strict": tool.strict,
+                },
+            }
+        elif api_format == "openai_responses":
+            definition = {
+                "type": "function",
+                **fields,
+                "parameters": tool.parameters,
+                "strict": tool.strict,
+            }
+        elif api_format == "anthropic_messages":
+            definition = {**fields, "input_schema": tool.parameters}
+        else:
+            definition = {**fields, "parametersJsonSchema": tool.parameters}
+        definitions.append(definition)
+
+    options: dict[str, Any] = {
+        "tools": [{"functionDeclarations": definitions}]
+        if api_format == "gemini_generate_content"
+        else definitions
+    }
+    if choice is not None:
+        options.update(_tool_choice(api_format, choice, {tool.name for tool in tools}))
+    return options
+
+
+def _tool_choice(api_format: LLMAPIFormat, choice: object, names: set[str]) -> dict[str, Any]:
+    named = False
+    if isinstance(choice, dict):
+        kind = choice.get("type")
+        if kind in ("function", "tool"):
+            named = True
+            nested = choice.get("function")
+            choice = nested.get("name") if isinstance(nested, dict) else choice.get("name")
+            if not isinstance(choice, str) or choice not in names:
+                raise ValueError("tool_choice names a tool that is not attached")
+        else:
+            choice = "required" if kind == "any" else kind
+    if not isinstance(choice, str):
+        raise ValueError("tool_choice must be auto, none, required, or an attached tool name")  # noqa: TRY004 - Invalid overrides use the router configuration error path.
+    mode = not named and choice in {"auto", "none", "required"}
+    if not mode and choice not in names:
+        raise ValueError("tool_choice names a tool that is not attached")
+
+    if api_format == "gemini_generate_content":
+        config: dict[str, Any] = {"mode": "ANY"}
+        if mode:
+            config["mode"] = {"auto": "AUTO", "none": "NONE", "required": "ANY"}[choice]
+        if not mode:
+            config["allowedFunctionNames"] = [choice]
+        return {"toolConfig": {"functionCallingConfig": config}}
+    if api_format == "anthropic_messages":
+        if mode:
+            return {"tool_choice": {"type": "any" if choice == "required" else choice}}
+        return {"tool_choice": {"type": "tool", "name": choice}}
+    if mode:
+        return {"tool_choice": choice}
+    if api_format == "openai_chat_completions":
+        return {"tool_choice": {"type": "function", "function": {"name": choice}}}
+    return {"tool_choice": {"type": "function", "name": choice}}
 
 
 _TEXT_FIELD: dict[LLMAPIFormat, str] = {
@@ -149,6 +233,48 @@ def _token_count(value: object) -> int | None:
     return value if type(value) is int and value >= 0 else None
 
 
+def _parse_tool_call(call_id: Any, name: Any, arguments: Any) -> ToolCall | None:
+    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+        return None
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, RecursionError):
+            return None
+    if not isinstance(arguments, dict):
+        return None
+    return ToolCall(id=call_id, name=name, arguments=arguments)
+
+
+def _chat_tool_calls(message: dict[str, Any]) -> list[ToolCall]:
+    calls = []
+    for item in _objects(message.get("tool_calls")):
+        function = item.get("function")
+        if item.get("type", "function") != "function" or not isinstance(function, dict):
+            continue
+        if call := _parse_tool_call(
+            item.get("id"), function.get("name"), function.get("arguments")
+        ):
+            calls.append(call)
+    return calls
+
+
+def _gemini_tool_calls(parts: list[dict[str, Any]]) -> list[ToolCall]:
+    calls = []
+    for index, part in enumerate(parts):
+        function = part.get("functionCall")
+        if part.get("thought") is True or not isinstance(function, dict):
+            continue
+        # Older Gemini versions omit call identifiers. Keep the returned call index stable.
+        if call := _parse_tool_call(
+            function.get("id") or f"call_{index}",
+            function.get("name"),
+            function.get("args", {}),
+        ):
+            calls.append(call)
+    return calls
+
+
 def parse_response(body: Any, config: LLMModelConfig, latency_ms: int) -> LLMResult:
     api_format = config.request_format
     error = f"LLM response is missing valid {_TEXT_FIELD[api_format]}"
@@ -161,7 +287,10 @@ def parse_response(body: Any, config: LLMModelConfig, latency_ms: int) -> LLMRes
     try:
         if api_format == "openai_chat_completions":
             message = body["choices"][0]["message"]
-            content = message["content"]
+            if not isinstance(message, dict):
+                raise TypeError(error)
+            content = message.get("content")
+            calls = _chat_tool_calls(message)
             usage_keys = ("prompt_tokens", "completion_tokens")
         elif api_format == "openai_responses":
             items = _objects(body["output"])
@@ -170,20 +299,44 @@ def parse_response(body: Any, config: LLMModelConfig, latency_ms: int) -> LLMRes
                 for item in items
                 if item.get("type") == "message"
             )
+            calls = [
+                call
+                for item in items
+                if item.get("type") == "function_call"
+                and (
+                    call := _parse_tool_call(
+                        item.get("call_id") or item.get("id"),
+                        item.get("name"),
+                        item.get("arguments"),
+                    )
+                )
+            ]
         elif api_format == "anthropic_messages":
-            content = _text_blocks(body["content"], "text")
+            blocks = _objects(body["content"])
+            content = _text_blocks(blocks, "text")
+            calls = [
+                call
+                for block in blocks
+                if block.get("type") == "tool_use"
+                and (
+                    call := _parse_tool_call(block.get("id"), block.get("name"), block.get("input"))
+                )
+            ]
         else:
             parts = _objects(body["candidates"][0]["content"]["parts"])
             content = _join_text(
                 part.get("text") for part in parts if part.get("thought") is not True
             )
+            calls = _gemini_tool_calls(parts)
             model = body.get("modelVersion")
             usage = body.get("usageMetadata")
             usage_keys = ("promptTokenCount", "candidatesTokenCount")
     except (KeyError, IndexError, TypeError):
         raise ValueError(error) from None
     if not isinstance(content, str):
-        raise TypeError(error)
+        if not calls or content is not None:
+            raise TypeError(error)
+        content = ""
 
     if not isinstance(usage, dict):
         usage = {}
@@ -193,4 +346,5 @@ def parse_response(body: Any, config: LLMModelConfig, latency_ms: int) -> LLMRes
         latency_ms=latency_ms,
         prompt_tokens=_token_count(usage.get(usage_keys[0])),
         completion_tokens=_token_count(usage.get(usage_keys[1])),
+        tool_calls=calls,
     )

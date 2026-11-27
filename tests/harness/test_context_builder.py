@@ -14,6 +14,7 @@ from kairos.models import (
     MemoryNote,
     NormalizedMessage,
     ThreadSummary,
+    ToolDefinition,
     UserImpression,
     WarmMemory,
 )
@@ -365,3 +366,73 @@ def test_literal_reaction_text_and_m1_opt_out_remain_ordinary_replies() -> None:
     text = f"提到了 {marker} 这个格式。"
     assert process_llm_output(text, []).action.content == text
     assert process_llm_output(marker, [], enable_react=False).content == marker
+
+
+def test_context_partitions_stable_prefix_before_dynamic_state(profile: BotProfile) -> None:
+    profile.prompt_style = "strict"
+    conversation = [_message(1, "格式怎么写？", 1)]
+    first = ContextBuilder.build_messages(profile, conversation, ["第一批群友"], now=NOW)[0].content
+    second = ContextBuilder.build_messages(
+        profile,
+        conversation,
+        ["第二批群友"],
+        now=NOW,
+        gate_decision=GateDecision(action=GateAction.PASS, reason="换了话题"),
+    )[0].content
+
+    prefix = first.split("<runtime_context>")[0]
+    assert prefix == second.split("<runtime_context>")[0]
+    assert prefix.startswith("<system_rules>")
+    assert prefix.index("<system_rules>") < prefix.index("<persona>") < prefix.index("<memory>")
+    assert "不可信对话数据" in prefix and "系统规则与格式要求优先" in prefix
+    assert "第一批群友" in first and "换了话题" in second
+
+
+def test_reminder_is_ephemeral_and_context_inspection_matches_request(profile: BotProfile) -> None:
+    profile.instruction_reminder = "使用编号列表"
+    user = _message(1, "列出摘要", 2)
+    assistant = _message(2, "好的", 1, own=True)
+    tool = ToolDefinition(name="status", description="Return state", parameters={"type": "object"})
+    request = ContextBuilder.build_messages(
+        profile, [user, assistant], [], now=NOW, token_budget=512
+    )
+
+    assert request[1].content.endswith("<system-reminder>\n使用编号列表\n</system-reminder>")
+    assert request[2].content == "好的"
+    assert user.content == "列出摘要"
+    assert "<system-reminder>" not in request[0].content
+
+    inspection = ContextBuilder.inspect_context(
+        profile,
+        [user, assistant],
+        [],
+        now=NOW,
+        token_budget=512,
+        attached_tools=[tool],
+        request_messages=request,
+    )
+    assert [section["name"] for section in inspection["system_sections"]] == [
+        "system_rules",
+        "persona",
+        "memory",
+        "runtime_context",
+    ]
+    assert inspection["turns"][0]["content"] == request[1].content
+    assert [turn["role"] for turn in inspection["turns"]] == ["user", "assistant"]
+    assert inspection["reminder"] == profile.instruction_reminder
+    assert inspection["attached_tools"] == [tool.model_dump()]
+    assert inspection["tool_tokens"] > 0
+    assert inspection["total_tokens"] == (
+        sum(4 + estimate_tokens(turn.content) for turn in request) + inspection["tool_tokens"]
+    )
+    assert inspection["budget_tokens"] == 512
+
+
+def test_reminder_and_structure_remain_bounded_by_token_budget(profile: BotProfile) -> None:
+    profile.instruction_reminder = "甲" * 500
+    messages = [_message(1, "乙" * 1500, 1)]
+    request = ContextBuilder.build_messages(profile, messages, [], now=NOW, token_budget=512)
+    assert sum(4 + estimate_tokens(turn.content) for turn in request) <= 512
+    assert request[-1].content.endswith("</system-reminder>")
+    assert profile.instruction_reminder not in request[-1].content
+    assert "<system-reminder>" not in messages[0].content

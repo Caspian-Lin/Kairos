@@ -136,3 +136,83 @@ def test_restore_same_timestamp_uses_the_watermark_message_in_store_order() -> N
     assert compactor.merge_restored_context(
         [_summary("42", 4)], [_message("99", 4), boundary, after_boundary, boundary]
     )[1] == [after_boundary]
+
+
+def _m21_profile() -> BotProfile:
+    profile = _profile()
+    profile.compaction = CompactionConfig(enabled=True, keep_recent_messages=2)
+    return profile
+
+
+def _completion(content: str) -> LLMResult:
+    return LLMResult(
+        content=content,
+        model="worker",
+        latency_ms=1,
+        prompt_tokens=None,
+        completion_tokens=None,
+    )
+
+
+def test_m21_triggers_at_64k_or_before_ring_buffer_eviction() -> None:
+    profile = _m21_profile()
+    compactor = DefaultContextCompactor(AsyncMock(spec=LLMClient))
+    messages = [_message("1", 1, "甲" * 65_535), _message("2", 2), _message("3", 3)]
+    fixed_cost = (
+        estimate_tokens(profile.persona_prompt)
+        + 3 * (10 + estimate_tokens("U1 "))
+        + 2 * estimate_tokens("你好")
+    )
+    messages[0].content = "甲" * (65_535 - fixed_cost)
+    assert not compactor.should_compact(profile, messages)
+    messages[0].content += "甲"
+    assert compactor.should_compact(profile, messages)
+    messages[0].content = "很短"
+    profile.ring_buffer_size = 3
+    assert compactor.should_compact(profile, messages)
+
+
+async def test_m21_compaction_retries_over_16k_and_accepts_the_second_attempt() -> None:
+    llm = AsyncMock(spec=LLMClient)
+    llm.chat_completion.side_effect = [_completion("甲" * 16_385), _completion("乙" * 16_384)]
+    compactor = DefaultContextCompactor(llm)
+    messages = [_message(str(i), i) for i in range(5)]
+    outcome = await compactor.compact_with_outcome(_m21_profile(), 1, messages)
+
+    assert (outcome.status, outcome.attempts) == ("succeeded", 2)
+    assert outcome.summary is not None
+    assert outcome.summary.summary_text == "乙" * 16_384
+    assert outcome.summary.covered_until_msg_id == "2"
+    first, second = llm.chat_completion.await_args_list
+    assert first.kwargs["max_tokens"] == second.kwargs["max_tokens"] == 16_384
+    instruction = first.args[1][0].content
+    assert all(
+        word in instruction
+        for word in ("核心事实", "观点归属", "未决事项", "丢弃无关闲聊", "长期记忆")
+    )
+    assert "严格精简" in second.args[1][0].content
+
+
+async def test_m21_compaction_reports_reset_after_request_empty_and_over_budget_failures() -> None:
+    llm = AsyncMock(spec=LLMClient)
+    llm.chat_completion.side_effect = [TimeoutError, _completion(" "), _completion("甲" * 16_385)]
+    compactor = DefaultContextCompactor(llm)
+    messages = [_message(str(i), i) for i in range(4)]
+    outcome = await compactor.compact_with_outcome(_m21_profile(), 1, messages)
+
+    assert outcome.status == "reset_required"
+    assert outcome.summary is None and outcome.attempts == 3
+    assert outcome.reason == "summary_over_target"
+    assert llm.chat_completion.await_count == 3
+
+
+async def test_m21_compaction_respects_configured_maximum_attempts() -> None:
+    llm = AsyncMock(spec=LLMClient)
+    llm.chat_completion.return_value = _completion(" ")
+    profile = _m21_profile()
+    profile.compaction.max_retries = 2
+    messages = [_message(str(i), i) for i in range(4)]
+    outcome = await DefaultContextCompactor(llm).compact_with_outcome(profile, 1, messages)
+
+    assert outcome.status == "reset_required" and outcome.attempts == 2
+    assert outcome.reason == "empty_summary"
