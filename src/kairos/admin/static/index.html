@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kairos 管理台</title>
+<style>
+:root{color-scheme:light;--ink:#232822;--muted:#535d51;--accent:#4d6313;--selected:#e9eedf;--bg:#f4f6f2;--line:#dce1d8;--surface:#fff;--danger:#982e37;--warn:#764916;font-family:system-ui,"Microsoft YaHei",sans-serif;font-size:15px}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);line-height:1.5}button,input,textarea,select{font:inherit;color:inherit}button,input,textarea,select{border:1px solid var(--line);border-radius:6px;background:var(--surface)}button{cursor:pointer;padding:.48rem .8rem;white-space:nowrap}button:hover{background:var(--selected)}button:disabled{cursor:default;opacity:.58}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.primary{background:var(--accent);border-color:var(--accent);color:#fff}.primary:hover{background:#3f500f}.danger{color:var(--danger);border-color:#daa5a8}.danger:hover{background:#f8dfe0}input,textarea,select{padding:.5rem .65rem;min-width:0}textarea{display:block;width:100%;resize:vertical}
+header{height:62px;display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:0 clamp(1rem,3vw,2rem);border-bottom:1px solid var(--line);background:var(--surface)}.brand{display:flex;align-items:center;gap:.65rem;font-weight:750;font-size:1.09rem}.mark{display:grid;place-items:center;width:30px;height:30px;border-radius:7px;background:var(--accent);color:#fff;font-size:.9rem}.service{display:flex;align-items:center;gap:.5rem;color:var(--muted);font-size:.83rem}.service:before{content:"";width:8px;height:8px;background:currentColor;border-radius:50%}.service[data-up="true"]{color:#395313}
+.shell{display:grid;grid-template-columns:210px minmax(0,1fr);min-height:calc(100vh - 62px)}nav{background:#edf0ea;border-right:1px solid var(--line);padding:1.35rem .85rem;display:flex;flex-direction:column;gap:.3rem;align-items:stretch}nav button{background:transparent;border-color:transparent;text-align:left;color:var(--muted);width:100%;padding:.68rem .75rem}nav button[aria-pressed="true"]{background:var(--selected);border-color:#d4ddc6;color:#324610;font-weight:700}
+main{width:100%;max-width:1470px;padding:1.75rem clamp(1rem,3vw,2.35rem)}h1,h2,h3{margin:0;text-wrap:balance;line-height:1.25}h1{font-size:1.7rem;letter-spacing:-.025em}h2{font-size:1.1rem}h3{font-size:1rem}p{margin:.4rem 0;color:var(--muted)}.heading{display:flex;justify-content:space-between;align-items:start;gap:.8rem;margin-bottom:1.25rem}.bar,.actions{display:flex;flex-wrap:wrap;align-items:end;gap:.55rem}.bar{padding:.75rem 0;border-bottom:1px solid var(--line);margin-bottom:.65rem}.field{display:grid;gap:.25rem;min-width:0;color:var(--muted);font-size:.85rem}.field :is(input,select,textarea){color:var(--ink);width:100%}.bar .field{min-width:8.3rem}.bar .search{flex:1}.note{color:var(--muted);font-size:.85rem}.error{color:var(--danger)}.feedback{min-height:1.5rem;margin-top:.5rem}.stack{display:grid;gap:.8rem}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:9px;overflow:hidden}.pad{padding:1rem}.table-scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:.87rem}th,td{padding:.62rem .7rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--muted);background:var(--bg);font-weight:650}tbody tr:last-child td{border-bottom:0}th:first-child,td:first-child{white-space:nowrap}.badge{display:inline-block;padding:.12rem .42rem;border-radius:5px;background:#edf0ea;color:#34452c;font:600 .75rem system-ui,sans-serif}.badge.error,.badge [data-state="error"]{background:#f8dfe0;color:var(--danger)}.badge.warning,.badge.filtered{background:#fff0d5;color:var(--warn)}.badge.ok,.badge.info{background:#e9eedf;color:#395313}.empty{padding:1rem;color:var(--muted)}
+.split{display:grid;grid-template-columns:minmax(205px,.7fr) minmax(0,1.7fr);gap:1rem;align-items:start}.timeline-list{max-height:66vh;overflow:auto}.timeline-list button{display:block;width:100%;text-align:left;padding:.7rem .85rem;border:0;border-bottom:1px solid var(--line);border-radius:0;white-space:normal}.timeline-list button[aria-pressed="true"]{background:var(--selected)}.entry-top,.row-top{display:flex;justify-content:space-between;gap:.55rem;align-items:center}.entry-preview{display:block;margin-top:.3rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:.87rem}.steps{list-style:none;margin:.65rem 0;padding:0}.steps li{padding:.55rem 0;border-bottom:1px solid var(--line)}.steps li:last-child{border-bottom:0}.meter{width:100%;height:.35rem;accent-color:var(--accent);margin:.35rem 0;display:block}
+details{border:1px solid var(--line);border-radius:7px;padding:.65rem;background:var(--surface);min-width:0}summary{cursor:pointer;font-weight:650}pre{max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;font:.83rem/1.5 ui-monospace,monospace;margin:.55rem 0 0}.meta{font-size:.77rem;color:var(--muted)}.context-parts{display:grid;gap:.5rem;margin:.65rem 0}.turn{padding:.7rem .85rem;background:var(--bg);border-radius:7px}.turn.assistant{margin-left:1.5rem;background:var(--selected)}.context-stats{color:var(--muted);font-size:.87rem}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,13em),1fr));gap:.85rem}.wide{grid-column:1/-1}.toggle{display:flex;align-items:center;gap:.55rem;padding:.55rem 0}.toggle input{accent-color:var(--accent);height:1rem;width:1rem}.config-group{margin-top:.7rem}.config-group .form-grid{margin:.65rem 0}.config-group legend{font-weight:700}.sticky-actions{padding-top:1rem;margin-top:1rem;border-top:1px solid var(--line)}
+#auth{padding:.7rem;margin-bottom:1rem;background:var(--surface);border:1px solid var(--line);border-radius:7px}#auth label{flex:1}[hidden]{display:none!important}code{font:inherit;overflow-wrap:anywhere}td,.entry-top,.row-top{overflow-wrap:anywhere}.compact td:nth-child(2){overflow-wrap:anywhere}.section-gaps{margin-top:1rem}
+@media(max-width:850px){.shell{grid-template-columns:145px minmax(0,1fr)}.split{grid-template-columns:1fr}.timeline-list{max-height:17rem}}
+@media(max-width:620px){header{height:auto;min-height:54px}.shell{display:block}nav{flex-direction:row;overflow:auto;border-right:0;border-bottom:1px solid var(--line);padding:.45rem .65rem}nav button{width:auto;flex:none}main{padding-top:1rem}.heading{flex-wrap:wrap}h1{font-size:1.4rem}}
+</style>
+</head>
+<body>
+<header><div class="brand"><span class="mark" aria-hidden="true">K</span>Kairos 管理台</div><span class="service" id="connection" role="status">连接中</span></header>
+<div class="shell">
+<nav aria-label="管理功能">
+<button data-view="logs" aria-pressed="true">实时日志</button>
+<button data-view="config" aria-pressed="false">Bot 配置</button>
+<button data-view="context" aria-pressed="false">Context 预览</button>
+<button data-view="traces" aria-pressed="false">消息流水线</button>
+<button data-view="control" aria-pressed="false">运行控制</button>
+</nav>
+<main>
+<form id="auth" class="actions" hidden><label class="field">Admin 访问令牌<input id="auth-token" type="password" autocomplete="current-password" required></label><button class="primary">连接</button></form>
+<div class="feedback error" id="global-error" role="alert" hidden></div>
+<section data-panel="logs">
+<div class="heading"><div><h1>实时日志</h1><p>筛选服务事件，检查 Bot、OneBot 与后台任务的状态。</p></div><div class="actions"><button id="pause">暂停</button><button id="clear">清空视图</button></div></div>
+<div class="bar" id="log-filters"><label class="field">级别<select id="level"><option value="">全部级别</option><option>debug</option><option>info</option><option>warning</option><option>error</option></select></label><label class="field">Bot ID<input id="log-bot" placeholder="全部 Bot" inputmode="numeric"></label><label class="field search">搜索<input id="query" type="search" placeholder="事件或内容"></label></div>
+<div class="panel table-scroll"><table><thead><tr><th>时间</th><th>级别</th><th>事件</th><th>字段</th></tr></thead><tbody id="logs"></tbody></table><div id="logs-empty" class="empty">等待日志事件。</div></div>
+</section>
+<section data-panel="config" hidden>
+<div class="heading"><div><h1>Bot 配置</h1><p>编辑非敏感字段并保存到 Bot YAML。</p></div><label class="field">Bot ID<select id="bot"></select></label></div>
+<form id="config" class="panel pad" hidden>
+<div class="form-grid">
+<label class="field">显示名<input data-key="nickname" required></label>
+<label class="field">控制面<select data-key="prompt_style"><option value="companion">Companion</option><option value="strict">Strict</option></select></label>
+<label class="field wide">人设<textarea data-key="persona_prompt" rows="4" required></textarea></label>
+<label class="field wide">瞬态指令<textarea data-key="instruction_reminder" rows="2" maxlength="500"></textarea></label>
+</div>
+<details class="config-group"><summary>门控与限流</summary><label class="toggle"><input type="checkbox" data-key="gate.enabled">启用模型门控</label><label class="toggle"><input type="checkbox" id="cooldown">启用普通聊天回复冷却</label><div class="form-grid"><label class="field">门控人设<textarea data-key="gate.persona_card" maxlength="200" rows="2"></textarea></label><label class="field">冷却（秒）<input type="number" data-key="rate_limit.cooldown_seconds" min="0" step="0.1" required></label><label class="field">同群 Bot 连续轮次<input type="number" data-key="rate_limit.peer_bot_max_turns" min="0" required></label></div></details>
+<details class="config-group" open><summary>上下文压缩</summary><label class="toggle"><input type="checkbox" data-key="compaction.enabled">启用后台压缩</label><div class="form-grid"><label class="field">输入预算<input type="number" data-key="compaction.input_token_budget" min="512" required></label><label class="field">触发 Token<input type="number" data-key="compaction.trigger_tokens" min="512" required></label><label class="field">摘要 Token 上限<input type="number" data-key="compaction.target_summary_tokens" min="128" required></label><label class="field">最大尝试次数<input type="number" data-key="compaction.max_retries" min="1" max="5" required></label></div></details>
+<details class="config-group"><summary>后台记忆</summary><label class="toggle"><input type="checkbox" data-key="memory.enabled">启用记忆召回</label><div class="form-grid"><label class="field">预热消息间隔<input type="number" data-key="memory.warm_trigger_messages" min="1" required></label><label class="field">回忆笔记上限<input type="number" data-key="memory.max_notes_recalled" min="0" required></label></div></details>
+<div class="actions sticky-actions"><button class="primary" type="submit">保存配置</button><button type="button" id="open-preview">预览 Context</button><button type="button" data-reload>热重载生效</button></div>
+<div class="feedback" id="config-note" role="status"></div>
+</form>
+<div class="empty" id="config-empty">选择要编辑的 Bot。</div>
+</section>
+<section data-panel="context" hidden>
+<div class="heading"><div><h1>Context 预览</h1><p id="preview-description">使用当前 Bot 草稿和会话数据拼装模型请求。</p></div></div>
+<form id="preview-form" class="bar"><label class="field">群号（可选）<input id="preview-group" inputmode="numeric" pattern="[0-9]+" placeholder="最近活跃群"></label><button class="primary">预览 Context</button></form>
+<div id="preview-note" role="status" class="feedback"></div><div id="preview" class="stack"></div>
+</section>
+<section data-panel="traces" hidden>
+<div class="heading"><div><h1>消息流水线</h1><p>选择一条消息，检查决策路径和实际请求。</p></div><button id="refresh-traces">刷新</button></div>
+<div class="split"><div class="panel timeline-list" id="traces"></div><div class="panel pad" id="trace-detail"><p>选择一条追踪记录查看详情。</p></div></div>
+</section>
+<section data-panel="control" hidden>
+<div class="heading"><div><h1>运行控制</h1><p>查看在线连接，并应用磁盘上的 Bot 配置。</p></div><button id="refresh-status">刷新</button></div>
+<div class="panel table-scroll"><table><thead><tr><th>Bot</th><th>OneBot 状态</th><th>活跃群</th><th>功能</th></tr></thead><tbody id="bots"></tbody></table><div class="empty" id="bots-empty">等待服务状态。</div></div>
+<div class="actions sticky-actions"><button class="primary" data-reload>热重载 Bot 配置</button><button class="danger" id="restart">重启整个 Kairos 进程</button></div><div class="feedback" id="control-note" role="status"></div>
+</section>
+</main></div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const field = key => document.querySelector('[data-key="' + key + '"]');
+const inputs = [...document.querySelectorAll("#config [data-key]")];
+const defaults = {
+  nickname:"", prompt_style:"companion", persona_prompt:"", instruction_reminder:"",
+  "gate.enabled":false, "gate.persona_card":"", "rate_limit.cooldown_seconds":3, "rate_limit.peer_bot_max_turns":2,
+  "compaction.enabled":false, "compaction.input_token_budget":65536, "compaction.trigger_tokens":65536,
+  "compaction.target_summary_tokens":16384, "compaction.max_retries":3,
+  "memory.enabled":false, "memory.warm_trigger_messages":6, "memory.max_notes_recalled":5
+};
+let token = "", view = "logs", stream, paused = false, selectedTrace, loadedBot, configDefaults = {}, traceItems = [];
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = text;
+  if (cls) node.className = cls;
+  return node;
+}
+const body = data => JSON.stringify(data);
+const pretty = value => JSON.stringify(value, null, 2);
+const millis = value => Number.isFinite(value) ? value + " ms" : "—";
+function notice(id, message="", bad=false) {
+  const node=$(id); node.textContent=message; node.classList.toggle("error",bad);
+  if(id==="global-error") node.hidden=!message;
+}
+async function api(path, options={}) {
+  const headers = {};
+  if (token) headers.Authorization = "Bearer " + token;
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  const response = await fetch(path, {...options, headers, cache:"no-store"});
+  if (response.status === 401) {
+    $("auth").hidden=false; $("connection").dataset.up="false"; $("connection").textContent="等待认证";
+    throw new Error("请输入有效的 Admin 访问令牌。");
+  }
+  if (!response.ok) throw new Error(await response.text());
+  $("auth").hidden=true; $("connection").dataset.up="true"; $("connection").textContent="本地服务在线";
+  return response;
+}
+const get = async (path, options) => (await api(path, options)).json();
+const status = () => get("/api/status");
+function logParams() {
+  return new URLSearchParams({level:$("level").value, bot_id:$("log-bot").value.trim(), query:$("query").value.trim()});
+}
+function badge(value) {
+  const tag=el("span", value, "badge");
+  if (["error","warning","info","ok","filtered"].includes(value)) tag.classList.add(value);
+  return tag;
+}
+const shortTime = value => new Date(value).toLocaleTimeString("zh-CN", {hour12:false});
+function addLog(item, newest=true) {
+  const row=el("tr"); row.dataset.id=item.id;
+  if ([...$("logs").children].some(other => other.dataset.id===row.dataset.id)) return;
+  const level=el("td"); level.append(badge(item.level));
+  const fields=el("td"); if (Object.keys(item.fields).length) fields.append(el("pre",pretty(item.fields)));
+  row.append(el("td",shortTime(item.timestamp)),level,el("td",item.event),fields);
+  if(newest) $("logs").prepend(row); else $("logs").append(row);
+  while($("logs").children.length>200) $("logs").lastElementChild.remove();
+  $("logs-empty").hidden=true;
+}
+function closeStream() { if(stream) stream.abort(); stream=undefined; }
+async function events(path, signal, receive) {
+  const response = await api(path, {signal});
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  let pending="";
+  try {
+    while(!signal.aborted) {
+      const {done,value} = await reader.read();
+      if(done) break;
+      pending+=decoder.decode(value,{stream:true});
+      let end;
+      while((end=pending.indexOf("\n\n"))>=0) {
+        const frame=pending.slice(0,end); pending=pending.slice(end+2);
+        if(frame.startsWith("data: ")) receive(JSON.parse(frame.slice(6)));
+      }
+    }
+  } finally { reader.releaseLock(); }
+}
+async function logView() {
+  closeStream();
+  if(paused) return;
+  const controller=stream=new AbortController();
+  const {signal}=controller, params=logParams();
+  const items=await get("/api/logs?"+params,{signal});
+  if(signal.aborted) return;
+  $("logs").replaceChildren(); $("logs-empty").hidden=!!items.length;
+  for(const item of items) addLog(item,false);
+  await events("/api/logs/stream?"+params,signal,addLog);
+}
+function faded(text) { return el("p",text,"note"); }
+async function selectTrace(id) {
+  selectedTrace=id; renderTraceList();
+  const trace=await get("/api/traces/"+encodeURIComponent(id));
+  if(selectedTrace!==id || view!=="traces") return;
+  const output=$("trace-detail"); output.replaceChildren(el("h2","消息 "+trace.msg_id));
+  const top=el("div",undefined,"row-top"); top.append(el("span",trace.sender_alias+" · 群 "+trace.group_id,"note"),badge(trace.outcome)); output.append(top);
+  output.append(faded(trace.input_preview+" · 总耗时 "+millis(trace.total_latency_ms)));
+  const steps=el("ol",undefined,"steps");
+  for(const step of trace.steps) {
+    const li=el("li"), title=el("div",undefined,"row-top");
+    title.append(el("strong",step.stage),el("span",millis(step.latency_ms),"meta"),badge(step.status));
+    li.append(title);
+    const progress=el("progress",undefined,"meter"); progress.max=Math.max(1,trace.total_latency_ms); progress.value=step.latency_ms;
+    progress.setAttribute("aria-label",step.stage+" 耗时"); li.append(progress);
+    if(Object.keys(step.detail).length) li.append(el("pre",pretty(step.detail)));
+    steps.append(li);
+  }
+  output.append(steps);
+  if(trace.request_context) {
+    const details=el("details"); details.append(el("summary","实际请求 Context"),contextBlock(trace.request_context)); output.append(details);
+  } else output.append(faded("该轮在构建主模型请求前结束。"));
+}
+function renderTraceList() {
+  const list=$("traces"); list.replaceChildren();
+  if(!traceItems.length) {list.append(el("div","等待消息流水线记录。","empty"));return;}
+  for(const trace of traceItems) {
+    const btn=el("button"); btn.setAttribute("aria-pressed",String(trace.trace_id===selectedTrace));
+    const top=el("span",undefined,"entry-top"); top.append(el("strong","m"+trace.msg_id),badge(trace.outcome));
+    btn.append(top,el("span",trace.input_preview,"entry-preview"),el("span",shortTime(trace.started_at)+" · "+trace.bot_id,"meta"));
+    btn.onclick=()=>run(()=>selectTrace(trace.trace_id)); list.append(btn);
+  }
+}
+async function traceView() {
+  closeStream();
+  const controller=stream=new AbortController(), {signal}=controller;
+  traceItems=await get("/api/traces",{signal}); renderTraceList();
+  if(traceItems.length && !selectedTrace) run(()=>selectTrace(traceItems[0].trace_id));
+  await events("/api/traces/stream",signal,trace=>{
+    traceItems=[trace,...traceItems.filter(old=>old.trace_id!==trace.trace_id)].slice(0,50);
+    renderTraceList();
+    if(!selectedTrace) run(()=>selectTrace(trace.trace_id));
+  });
+}
+function block(title, text) {
+  const details=el("details"); details.append(el("summary",title),el("pre",text)); return details;
+}
+function contextBlock(context) {
+  const node=el("div",undefined,"section-gaps");
+  const total=context.total_tokens, budget=context.budget_tokens;
+  node.append(el("p","估算 "+(total??"—")+" Token"+(budget?" / "+budget+" 预算":""),"context-stats"));
+  if(budget){
+    const meter=el("progress",undefined,"meter"); meter.max=budget; meter.value=Math.min(budget,total||0);
+    meter.setAttribute("aria-label","估算 Token 预算占用"); node.append(meter);
+  }
+  const parts=el("div",undefined,"context-parts");
+  for(const section of (context.system_sections||[])) {
+    if(!section||typeof section!=="object") continue;
+    if(section.name==="memory" && section.content) {
+      for(const entry of section.content.split(/\n\n(?=(?:历史对话摘要|群友画像|相关事件笔记|活跃线程板)\n)/).filter(part=>part.includes("\n"))) {
+        const end=entry.indexOf("\n");
+        parts.append(block(entry.slice(0,end),entry.slice(end+1)));
+      }
+    } else {
+      const fold=block(section.name,section.content);
+      fold.open=["system_rules","persona","system"].includes(section.name); parts.append(fold);
+    }
+  }
+  for(const turn of (context.turns||[])) {
+    if(!turn||typeof turn!=="object") continue;
+    const card=el("div",undefined,turn.role==="assistant"?"turn assistant":"turn");
+    card.append(badge(turn.role),el("pre",turn.content)); parts.append(card);
+  }
+  if(context.reminder) parts.append(block("<system-reminder>",context.reminder));
+  if(context.attached_tools?.length) parts.append(block("挂载的工具",pretty(context.attached_tools)));
+  node.append(parts); return node;
+}
+function formValue(control) {
+  if(control.type==="checkbox") return control.checked;
+  if(control.type==="number") return control.valueAsNumber;
+  return control.value;
+}
+function putPatch(object,path,value) {
+  const [first,second]=path.split(".");
+  if(second) (object[first]??={})[second]=value; else object[first]=value;
+}
+function draft() {
+  if(!$("config").reportValidity()) throw new Error("请检查标出的配置字段。");
+  const patch={};
+  for(const control of inputs) {
+    const key=control.dataset.key, value=formValue(control);
+    if(value!==configDefaults[key]) putPatch(patch,key,value);
+  }
+  if((patch.compaction?.target_summary_tokens!==undefined || patch.compaction?.trigger_tokens!==undefined)
+    && field("compaction.target_summary_tokens").valueAsNumber>=field("compaction.trigger_tokens").valueAsNumber) {
+    throw new Error("摘要 Token 上限必须小于压缩触发 Token。");
+  }
+  return patch;
+}
+async function loadConfig(id) {
+  loadedBot=undefined; $("config").hidden=true; $("config-empty").hidden=false;
+  if(!id) return;
+  const data=await get("/api/bots/"+encodeURIComponent(id)+"/config");
+  if($("bot").value!==id) return;
+  configDefaults={};
+  for(const control of inputs) {
+    const path=control.dataset.key, [root,key]=path.split(".");
+    const value=(key?data[root]?.[key]:data[root])??defaults[path];
+    configDefaults[path]=value;
+    if(control.type==="checkbox") control.checked=!!value; else control.value=String(value);
+  }
+  $("cooldown").checked=field("rate_limit.cooldown_seconds").valueAsNumber>0;
+  loadedBot=id; $("config").hidden=false; $("config-empty").hidden=true;
+  notice("config-note");
+}
+async function loadProfiles() {
+  const data=await status(), select=$("bot"), current=select.value;
+  select.replaceChildren(...data.configurable_bots.map(id=>new Option(id,id)));
+  if(data.configurable_bots.includes(current)) select.value=current;
+  if(loadedBot!==select.value) await loadConfig(select.value);
+}
+async function preview() {
+  if(!loadedBot) await loadProfiles();
+  if(!loadedBot) throw new Error("没有可预览的 Bot 配置。");
+  if(!$("preview-form").reportValidity()) return;
+  notice("preview-note","生成预览中…");
+  const group=$("preview-group").value.trim(), patch=draft();
+  const result=await get("/api/bots/"+encodeURIComponent(loadedBot)+"/context-preview",{
+    method:"POST", body:body({patch,...(group?{group_id:Number(group)}:{})})
+  });
+  $("preview-description").textContent=result.sample?"当前没有匹配的活动会话，使用示例对话预览。":"使用活动会话与当前草稿拼装请求。";
+  $("preview").replaceChildren(contextBlock(result)); notice("preview-note");
+}
+async function controlView() {
+  const data=await status(), table=$("bots"); table.replaceChildren();
+  $("bots-empty").hidden=!!data.bots.length;
+  for(const bot of data.bots) {
+    const row=el("tr"), name=el("td"), online=el("td"), count=el("td");
+    name.append(el("strong",bot.nickname),el("div",bot.bot_id+" · "+bot.self_id,"meta"));
+    online.append(badge(bot.online?"在线":"离线"));
+    count.append(el("strong",bot.active_sessions));
+    if(bot.groups.length) count.append(block("群精力",bot.groups.map(group=>group.group_id+"  ·  "+group.energy).join("\n")));
+    const enabled=[bot.features.gate?"门控":null,bot.features.compaction?"压缩":null,bot.features.memory?"记忆":null,bot.features.trace?"追踪":null,bot.features.prompt_style];
+    row.append(name,online,count,el("td",enabled.filter(Boolean).join(" · "))); table.append(row);
+  }
+}
+function run(work, errorTarget="global-error") {
+  notice("global-error");
+  Promise.resolve().then(work).catch(error=>{
+    if(error.name!=="AbortError") notice(errorTarget,error.message||"本地接口暂时不可用。",true);
+  });
+}
+function show(next) {
+  view=next; closeStream();
+  for(const panel of document.querySelectorAll("[data-panel]")) panel.hidden=panel.dataset.panel!==view;
+  for(const button of document.querySelectorAll("[data-view]")) button.setAttribute("aria-pressed",String(button.dataset.view===view));
+  if(view==="logs") run(logView); else if(view==="traces") run(traceView); else if(view==="config") run(loadProfiles); else if(view==="control") run(controlView);
+}
+document.querySelector("nav").onclick=event=>{const next=event.target.closest("[data-view]");if(next)show(next.dataset.view);};
+$("auth").onsubmit=event=>{event.preventDefault();token=$("auth-token").value;$("auth-token").value="";show(view);if(view==="context")run(preview,"preview-note");};
+let filterTimer;
+$("log-filters").oninput=()=>{clearTimeout(filterTimer);filterTimer=setTimeout(()=>{if(view==="logs")run(logView);},220);};
+$("pause").onclick=()=>{paused=!paused;$("pause").textContent=paused?"继续":"暂停";if(paused)closeStream();else run(logView);};
+$("clear").onclick=()=>{$("logs").replaceChildren();$("logs-empty").hidden=false;};
+$("bot").onchange=()=>run(()=>loadConfig($("bot").value));
+$("cooldown").onchange=()=>{
+  const seconds=field("rate_limit.cooldown_seconds");
+  seconds.value=$("cooldown").checked?String(configDefaults["rate_limit.cooldown_seconds"]||3):"0";
+};
+field("rate_limit.cooldown_seconds").oninput=event=>{$("cooldown").checked=event.target.valueAsNumber>0;};
+$("config").onsubmit=event=>{event.preventDefault();run(async()=>{
+  const id=loadedBot; await get("/api/bots/"+encodeURIComponent(id)+"/config",{method:"PUT",body:body(draft())});
+  await loadConfig(id); notice("config-note","已保存到 YAML。可以热重载应用。");
+},"config-note");};
+$("open-preview").onclick=()=>{show("context");run(preview,"preview-note");};
+$("preview-form").onsubmit=event=>{event.preventDefault();run(preview,"preview-note");};
+$("refresh-traces").onclick=()=>run(traceView);
+$("refresh-status").onclick=()=>run(controlView);
+for(const button of document.querySelectorAll("[data-reload]")) button.onclick=()=>{
+  const target=view==="config"?"config-note":"control-note";
+  run(async()=>{button.disabled=true;try{
+    await get("/api/control/reload",{method:"POST",body:"{}"});
+    notice(target,"Bot 配置已热重载。");
+    if(view==="control")await controlView();
+  }finally{button.disabled=false;}},target);
+};
+$("restart").onclick=()=>{
+  if(!window.confirm("重启 Kairos 会暂时断开 OneBot 和此页面。继续重启？"))return;
+  run(async()=>{await get("/api/control/restart",{method:"POST",body:"{}"});notice("control-note","重启请求已提交。服务恢复后可刷新状态。");},"control-note");
+};
+window.addEventListener("pagehide",closeStream);
+show("logs");
+</script>
+</body>
+</html>

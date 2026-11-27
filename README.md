@@ -1,6 +1,6 @@
 # Kairos（知时）
 
-Kairos 在一个 Python 进程内托管 1–3 个 QQ Bot，通过 OneBot v11 反向 WebSocket 接收群消息。它使用 PostgreSQL 保存群消息和决策审计，并按每个 Bot 的模型配置生成回复。Stage 1-B（M2）支持可选的双级门控、贴表情、滚动摘要和免 Embedding 群聊记忆。 [当前进度与交接](docs/HANDOFF.md) · [Stage 1 实现规划](docs/Kairos_设计文档/02_Kairos_Stage1_技术栈与2C4G工程实现规划.md)
+Kairos 在一个 Python 进程内托管 1–3 个 QQ Bot，通过 OneBot v11 反向 WebSocket 接收群消息。它使用 PostgreSQL 保存群消息和决策审计，并按每个 Bot 的模型配置生成回复。Stage 1-B（M2）支持双级门控、贴表情、滚动摘要和免 Embedding 群聊记忆。M2.1 增加 64k→16k 压缩、按需工具 Schema、流水线追踪与本地 Admin 管理台。 [当前进度与交接](docs/HANDOFF.md) · [Stage 1 实现规划](docs/Kairos_设计文档/02_Kairos_Stage1_技术栈与2C4G工程实现规划.md)
 
 ## 在 WSL2 本地运行
 
@@ -135,7 +135,7 @@ Kairos 的反向监听端口写在 `config/global.yaml` 的 `onebot_ws.port`，�
 
 `debug_groups` 可逐行添加需要联调的白名单群号。主模型在调试群选择沉默时，Kairos 引用触发消息发送「这条触发成功但是模型选择沉默」。处理群消息出错时，各白名单群都能收到错误类型和可用的 HTTP 状态码。系统提示与聊天历史分开处理。
 
-### M2 可选配置
+### M2.1 可选配置
 
 `gate`、`compaction`、`memory` 分别按 Bot 开启，默认均关闭。把下列字段加到该 Bot 的 YAML。示例复用现有 `llm.chat`，也可以在 `llm` 中新增不同的门控和后台模型槽，再把相应键写入 `gate_model_key`、`worker_model_key`。启用 `gate` 时必须配置 `gate_model_key`。后台生成摘要和提炼事件笔记使用 `worker_model_key`，已有记忆的召回可以独立启用。 [Bot 配置示例](config/examples/bots/1.yaml)
 
@@ -143,6 +143,9 @@ Kairos 的反向监听端口写在 `config/global.yaml` 的 `onebot_ws.port`，�
 trigger_mode: all_with_veto
 gate_model_key: chat
 worker_model_key: chat
+prompt_style: companion
+instruction_reminder: ""
+enabled_tools: []
 gate:
   enabled: true
   persona_card: 爱聊做饭，接得上话题才发言。
@@ -155,10 +158,11 @@ gate:
   energy_cost_react: 5.0
 compaction:
   enabled: true
-  input_token_budget: 4096
-  trigger_ratio: 0.75
+  input_token_budget: 65536
+  trigger_tokens: 65536
+  target_summary_tokens: 16384
+  max_retries: 3
   keep_recent_messages: 16
-  summary_max_tokens: 300
   max_persisted_summaries: 3
 memory:
   enabled: true
@@ -168,16 +172,36 @@ memory:
   note_extract_interval_messages: 12
 ```
 
-- `gate` 按群维护精力值，并把短人设卡（最多 200 字）、近期消息和线程板发给轻量模型。模型可以放行、沉默或贴表情。直接 `@` 或引用 Bot 聊天回复可绕过精力值与模型初筛。门控请求超时或输出无效时由 `fail_open` 决定是否放行。
+- `gate` 按群维护精力值，并把短人设卡（最多 200 字）、近期消息和线程板发给轻量模型。模型可以放行、沉默或贴表情。直接 `@` 或引用 Bot 回复可绕过精力值；有可用工具时，初筛仍可为直接提问选择工具。普通群聊的门控超时或输出无效时由 `fail_open` 决定是否放行。
 - 主模型可以回复、输出 `<|act:silent|>`，或用 `<|act:react:m123:76|>` 调用 NapCat 的 `set_msg_emoji_like`。贴表情的目标消息和表情 ID 记录在决策审计中。
-- `compaction` 在估算输入超过预算比例或旧消息即将被窗口淘汰时，安排后台模型总结较早的消息。首次进入会话时加载最近摘要，按水位线恢复后续原始消息。`input_token_budget` 最少为 512。
+- `compaction` 默认在估算输入达到 65,536 Token 或旧消息即将被窗口淘汰时总结较早的对话，摘要须在 16,384 Token 以内。超长、空输出或请求错误会重试，默认最多尝试三次。全部失败时清空旧上下文与热摘要，并记录重置水位线供重启恢复。`input_token_budget` 最少为 512。仅配置旧预算字段的 Bot 继续使用原有压缩触发与输出参数。
 - `memory` 按消息量异步预热群友画像和相关事件笔记。主聊天流程直接读取进程内的有界热缓存。画像、笔记和摘要均按 Bot 与群隔离，事件笔记用关键词和 `pg_trgm` 召回。
+- `prompt_style: strict` 强调格式和指令遵循。`instruction_reminder` 最多 500 字，随本轮最后一个 user turn 发送。`enabled_tools` 可填写应用注册的工具名，完整 Schema 仅随门控选中的请求发送。使用同一 QQ 账号测试两种人设时，可复制严格配置示例为 `config/bots/2.yaml`，每次只启用一个 ID。 [严格配置示例](config/examples/bots/2_strict_tester.yaml)
+
+### 本地 Admin 管理台
+
+Admin 默认关闭。启用时，在 `config/global.yaml` 中填写以下配置，并在本机 `.env` 中设置 `KAIROS_ADMIN_ACCESS_TOKEN`。
+
+```yaml
+admin_ui:
+  enabled: true
+  host: 127.0.0.1
+  port: 8081
+  access_token: "${KAIROS_ADMIN_ACCESS_TOKEN}"
+  log_buffer_size: 500
+  trace_buffer_size: 100
+```
+
+运行 `make kairos` 后打开 [本机 Admin 管理台](http://127.0.0.1:8081/)。页面包含实时日志、Bot 配置、Context 预览、消息流水线和运行控制。配置了令牌时，浏览器用 Bearer 头向 API 验证。日志和追踪缓冲按容量淘汰，可在流水线详情中查看实际请求的分区 Context。请保留回环地址和令牌，配置视图只返回非敏感字段及密钥占位符或掩码。
+
+在页面保存 Bot YAML 后点「热重载生效」，Kairos 会验证并重新装配 Bot，现有 NapCat 连接继续使用。Context 预览可直接使用未保存的草稿。全进程重启会排空并释放服务资源，再用当前进程参数和环境重新启动。更改 `.env` 后通过原启动入口重新启动 Kairos，以加载新环境。
 
 ## 测试和内存压测
 
 ```sh
 uv run ruff check .
 uv run ruff format --check .
+uv run mypy src
 uv run pytest -q -rs
 uv run pytest tests/integration/test_e2e_pipeline.py
 uv run python scripts/bench_memory.py
@@ -185,9 +209,9 @@ uv run python scripts/bench_memory.py
 
 端到端回放用本地 WebSocket 模拟 NapCat，用本地 HTTP 模拟模型接口。M1 场景覆盖独立模型配置、角色分离、过期回复和双 Bot 防互刷。M2 场景覆盖初筛沉默、Gate 与主模型贴表情及回执、主模型 Veto、摘要重启恢复、慢查询期间使用热记忆、精力耗尽后直接 `@` 回复。
 
-内存压测开启门控、线程追踪、热记忆和滚动摘要，在 3 个 Bot、每个 10 个活跃群上回放 5,000 条消息。脚本检查每群缓冲区、线程表、摘要和热缓存的容量，并要求 Kairos Core 的稳态 RSS 小于 180 MB。
+内存压测开启门控、线程追踪、热记忆、滚动摘要和 Admin 日志与追踪缓冲，在 3 个 Bot、每个 10 个活跃群上回放 5,000 条消息。脚本检查缓冲区、线程表、摘要与热缓存容量，并要求 Kairos Core 的稳态 RSS 小于 180 MB。
 
-2026-11-27 验收时，独立 PostgreSQL 16 库上的全量测试通过 280 项，其中 19 项是本地协议回放。绑定两颗逻辑 CPU、cgroup 内存上限为 4 GiB 时，压测稳态 RSS 为 **68.17 MB**，完成 510 次门控、480 次摘要写入和 240 次笔记写入。每群最多 40 个消息块、20 个线程和 3 条热摘要，共预热 30 个群会话。 [压测脚本](scripts/bench_memory.py)
+M2.1 验收覆盖 19 项本地协议回放，以及 Admin 鉴权、日志与追踪 SSE、安全配置写入、草稿 Context 预览和运行控制。绑定两颗逻辑 CPU、cgroup 内存上限设为 4 GiB 时，压测稳态 RSS 为 **74.02 MB**，保留 500 条日志和 100 条带上下文的流水线追踪。 [Admin 服务测试](tests/admin/test_admin_server.py) · [内存压测](scripts/bench_memory.py)
 
 可选 PostgreSQL 用例使用独立测试库。先设置 `KAIROS_TEST_PG_DSN`，再迁移并测试该数据库。
 
