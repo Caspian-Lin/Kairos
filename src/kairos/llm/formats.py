@@ -12,9 +12,9 @@ from kairos.models import ChatMessage, LLMResult
 _ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
 _OVERRIDES: dict[LLMAPIFormat, set[str]] = {
     "openai_chat_completions": {"temperature", "max_tokens", "stop", "response_format"},
-    "openai_responses": {"temperature", "max_tokens"},
-    "anthropic_messages": {"temperature", "max_tokens", "stop"},
-    "gemini_generate_content": {"temperature", "max_tokens", "stop"},
+    "openai_responses": {"temperature", "max_tokens", "response_format"},
+    "anthropic_messages": {"temperature", "max_tokens", "stop", "response_format"},
+    "gemini_generate_content": {"temperature", "max_tokens", "stop", "response_format"},
 }
 
 
@@ -42,6 +42,7 @@ def build_request(
     sampling = {} if temperature is None else {"temperature": temperature}
     stop = overrides.get("stop")
     stop_sequences = [stop] if isinstance(stop, str) else stop
+    response_format = overrides.get("response_format")
 
     if api_format == "openai_chat_completions":
         path = "chat/completions"
@@ -66,6 +67,8 @@ def build_request(
         }
         if max_tokens is not None:
             body["max_output_tokens"] = max_tokens
+        if response_format is not None:
+            body["text"] = {"format": response_format}
     else:
         system = "\n\n".join(turn["content"] for turn in turns if turn["role"] == "system")
         conversation = [turn for turn in turns if turn["role"] != "system"]
@@ -92,6 +95,8 @@ def build_request(
                 generation["maxOutputTokens"] = max_tokens
             if stop_sequences is not None:
                 generation["stopSequences"] = stop_sequences
+            if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+                generation["responseMimeType"] = "application/json"
             if config.thinking_level is not None:
                 generation["thinkingConfig"] = {"thinkingLevel": config.thinking_level.upper()}
             body = {
