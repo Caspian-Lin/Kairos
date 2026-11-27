@@ -257,6 +257,83 @@ async def test_failed_or_invalid_receipts_clean_pending_echoes(
         assert not gateway.pending_echoes
 
 
+@pytest.mark.parametrize("set_like", [True, False])
+async def test_emoji_like_sends_action_and_accepts_receipt(set_like: bool) -> None:
+    async with (
+        _gateway() as (gateway, client, url),
+        client.ws_connect(url, headers={"X-Self-ID": "101"}) as peer,
+        asyncio.TaskGroup() as tasks,
+    ):
+        reaction = tasks.create_task(
+            gateway.set_msg_emoji_like(101, " 505 ", "76", set_like=set_like)
+        )
+        request = await peer.receive_json(timeout=1)
+        assert request == {
+            "action": "set_msg_emoji_like",
+            "params": {"message_id": "505", "emoji_id": "76", "set": set_like},
+            "echo": request["echo"],
+        }
+        assert request["echo"] in gateway.pending_echoes
+        await peer.send_json({"status": "ok", "echo": request["echo"]})
+        assert await asyncio.wait_for(reaction, timeout=1) is None
+        assert not gateway.pending_echoes
+
+
+@pytest.mark.parametrize(
+    ("message_id", "emoji_id", "field"),
+    [
+        ("", "76", "message_id"),
+        ("  ", "76", "message_id"),
+        ("505", " ", "emoji_id"),
+        (505, "76", "message_id"),
+        ("505", 76, "emoji_id"),
+    ],
+)
+async def test_emoji_like_validates_ids(message_id: Any, emoji_id: Any, field: str) -> None:
+    gateway = OneBotWSGateway(OneBotWSConfig())
+    with pytest.raises(ValueError, match=field):
+        await gateway.set_msg_emoji_like(101, message_id, emoji_id)
+    assert not gateway.pending_echoes
+
+
+async def test_emoji_like_bot_offline() -> None:
+    gateway = OneBotWSGateway(OneBotWSConfig())
+    with pytest.raises(BotOfflineError, match="offline"):
+        await gateway.set_msg_emoji_like(101, "505", "76")
+    assert not gateway.pending_echoes
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error", "message"),
+    [
+        ("rejected", OneBotSendError, "rejected"),
+        ("timeout", OneBotSendError, "Timed out"),
+        ("disconnect", BotOfflineError, "disconnected"),
+    ],
+)
+async def test_emoji_like_cleans_pending_on_failure(
+    outcome: str, error: type[OneBotSendError], message: str
+) -> None:
+    async with (
+        _gateway(send_timeout_seconds=0.1) as (gateway, client, url),
+        client.ws_connect(url, headers={"X-Self-ID": "101"}) as peer,
+        asyncio.TaskGroup() as tasks,
+    ):
+
+        async def send_reaction() -> None:
+            with pytest.raises(error, match=message):
+                await gateway.set_msg_emoji_like(101, "505", "76")
+
+        reaction = tasks.create_task(send_reaction())
+        request = await peer.receive_json(timeout=1)
+        if outcome == "rejected":
+            await peer.send_json({"status": "failed", "echo": request["echo"]})
+        elif outcome == "disconnect":
+            await peer.close()
+        await asyncio.wait_for(reaction, timeout=1)
+        assert not gateway.pending_echoes
+
+
 async def test_stop_cleans_connections_and_waits_for_cancellation() -> None:
     started = asyncio.Event()
     finished = asyncio.Event()
