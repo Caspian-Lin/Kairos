@@ -3,9 +3,20 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from kairos.config import BotProfile
+from kairos.harness.compactor import estimate_tokens
 from kairos.harness.context_builder import ContextBuilder, format_relative_time
 from kairos.harness.postprocess import process_llm_output
-from kairos.models import NormalizedMessage
+from kairos.models import (
+    ActionType,
+    ContextSummary,
+    GateAction,
+    GateDecision,
+    MemoryNote,
+    NormalizedMessage,
+    ThreadSummary,
+    UserImpression,
+    WarmMemory,
+)
 
 NOW = datetime(2026, 11, 27, 12, tzinfo=UTC)
 
@@ -226,3 +237,131 @@ def test_jaccard_threshold_is_strict_and_short_replies_compare_characters() -> N
     assert exact_threshold.content == "abcdefgh"
     assert repeated_ack.repeated_dropped is True
     assert different_ack.content == "好"
+
+
+def test_context_injects_scoped_memory_and_gate_suggestion(profile: BotProfile) -> None:
+    prior = ContextSummary(
+        bot_id=profile.bot_id,
+        group_id=200,
+        summary_text="开始聊做饭",
+        covered_until_msg_id="10",
+        covered_until_at=NOW - timedelta(minutes=10),
+        token_estimate=5,
+        created_at=NOW,
+    )
+    recent = prior.model_copy(
+        update={"covered_until_at": NOW, "covered_until_msg_id": "11", "summary_text": "约好吃面"}
+    )
+    memory = WarmMemory(
+        summaries=[recent, prior],
+        impressions=[
+            UserImpression(
+                bot_id=profile.bot_id,
+                group_id=200,
+                user_qq=101,
+                nickname="阿明",
+                impression_summary="喜欢米粉",
+                updated_at=NOW,
+            )
+        ],
+        notes=[
+            MemoryNote(
+                bot_id=profile.bot_id,
+                scope_group_id=200,
+                entity_qqs=[101],
+                summary_text="上周在成都吃过米粉",
+                keywords=["米粉"],
+                created_at=NOW,
+            )
+        ],
+        threads=[
+            ThreadSummary(
+                thread_id="10",
+                root_msg_id="10",
+                latest_msg_id="11",
+                participants=["阿明"],
+                message_count=2,
+                heat=2,
+                last_active_at=NOW,
+            )
+        ],
+    )
+    prompt = ContextBuilder.build_messages(
+        profile,
+        [_message(12, "去哪吃？", 0)],
+        [],
+        now=NOW,
+        warm_memory=memory,
+        gate_decision=GateDecision(
+            action=GateAction.PASS, candidate_target="12", reason="群友问地点"
+        ),
+        enable_react=True,
+    )[0].content
+
+    assert prompt.index("开始聊做饭") < prompt.index("约好吃面")
+    for fragment in (
+        "历史对话摘要",
+        "[m10]",
+        "群友画像",
+        "阿明：喜欢米粉",
+        "相关事件笔记",
+        "上周在成都吃过米粉",
+        "活跃线程板",
+        "m10 → m11",
+        "初筛建议目标 m12",
+        "群友问地点",
+        "仅供参考",
+        "<|act:react:mID:emoji_id|>",
+    ):
+        assert fragment in prompt
+
+
+def test_token_budget_cuts_early_messages_inside_a_user_block(profile: BotProfile) -> None:
+    history = [
+        _message(1, "过期话题" * 180, 10),
+        _message(2, "一个旧的回复", 9, own=True),
+        _message(3, "也过期了" * 180, 8),
+        _message(4, "现在去吃饭？", 7),
+        _message(5, "好啊", 6, own=True),
+    ]
+    turns = ContextBuilder.build_messages(profile, history, [], now=NOW, token_budget=512)
+    assert [turn.role for turn in turns] == ["system", "user", "assistant"]
+    assert "现在去吃饭？" in turns[1].content and "也过期了" not in turns[1].content
+    assert turns[2].content == "好啊"
+    assert sum(4 + estimate_tokens(turn.content) for turn in turns) <= 512
+
+
+def test_token_budget_fits_an_oversized_latest_user_turn(profile: BotProfile) -> None:
+    turns = ContextBuilder.build_messages(
+        profile,
+        [_message(9, "新话题" * 1000, 1)],
+        [],
+        now=NOW,
+        token_budget=512,
+    )
+    assert [turn.role for turn in turns] == ["system", "user"]
+    assert "[m9]" in turns[1].content
+    assert sum(4 + estimate_tokens(turn.content) for turn in turns) <= 512
+
+
+@pytest.mark.parametrize("target", ["m123", "123"])
+def test_standalone_reaction_is_an_independent_action(target: str) -> None:
+    result = process_llm_output(f" <|act:react:{target}:76|>\n", [])
+    assert result.action.action is ActionType.REACT
+    assert result.action.target_msg_id == "123"
+    assert result.action.emoji_id == "76"
+    assert result.content == "" and not result.vetoed and not result.repeated_dropped
+
+
+@pytest.mark.parametrize("marker", ["<|act:react:mABC:76|>", "<|act:react:m123:|>"])
+def test_invalid_standalone_reaction_is_discarded(marker: str) -> None:
+    result = process_llm_output(marker, [])
+    assert result.action.action is ActionType.SILENT
+    assert result.action.target_msg_id is None and not result.vetoed
+
+
+def test_literal_reaction_text_and_m1_opt_out_remain_ordinary_replies() -> None:
+    marker = "<|act:react:123:76|>"
+    text = f"提到了 {marker} 这个格式。"
+    assert process_llm_output(text, []).action.content == text
+    assert process_llm_output(marker, [], enable_react=False).content == marker
