@@ -255,38 +255,69 @@ class OneBotWSGateway:
     async def send_group_msg(
         self, self_id: int, group_id: int, text: str, reply_to_msg_id: str | None = None
     ) -> str | None:
-        socket = self._connections.get(self_id)
-        if socket is None or socket.closed:
-            _log.warning("onebot_send_offline", self_id=self_id, group_id=group_id)
-            raise BotOfflineError(f"Bot {self_id} is offline")
-
         segments = [{"type": "text", "data": {"text": text}}]
         if reply_to_msg_id:
             segments.insert(0, {"type": "reply", "data": {"id": str(reply_to_msg_id)}})
+        response = await self._call_action(
+            self_id,
+            "send_group_msg",
+            {"group_id": group_id, "message": segments},
+            "send a message",
+            group_id=group_id,
+        )
+        try:
+            return _message_id(response["data"]["message_id"])
+        except (KeyError, TypeError, ValueError):
+            _log.warning("onebot_send_invalid_receipt", self_id=self_id, group_id=group_id)
+            raise OneBotSendError(
+                f"Bot {self_id} returned a receipt without a message ID"
+            ) from None
+
+    async def set_msg_emoji_like(
+        self, self_id: int, message_id: str, emoji_id: str, *, set_like: bool = True
+    ) -> None:
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise ValueError("message_id must be a non-empty string")
+        if not isinstance(emoji_id, str) or not emoji_id.strip():
+            raise ValueError("emoji_id must be a non-empty string")
+        await self._call_action(
+            self_id,
+            "set_msg_emoji_like",
+            {"message_id": message_id.strip(), "emoji_id": emoji_id.strip(), "set": set_like},
+            "set a message emoji reaction",
+            message_id=message_id.strip(),
+            emoji_id=emoji_id.strip(),
+        )
+
+    async def _call_action(
+        self,
+        self_id: int,
+        action: str,
+        params: dict[str, Any],
+        operation: str,
+        **log_fields: Any,
+    ) -> dict[str, Any]:
+        socket = self._connections.get(self_id)
+        if socket is None or socket.closed:
+            _log.warning("onebot_send_offline", self_id=self_id, **log_fields)
+            raise BotOfflineError(f"Bot {self_id} is offline")
+
         echo = uuid4().hex
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self.pending_echoes[echo] = _PendingEcho(socket, future)
         try:
             async with asyncio.timeout(self.config.send_timeout_seconds):
-                await socket.send_json(
-                    {
-                        "action": "send_group_msg",
-                        "params": {"group_id": group_id, "message": segments},
-                        "echo": echo,
-                    }
-                )
+                await socket.send_json({"action": action, "params": params, "echo": echo})
                 response = await future
         except BotOfflineError:
-            _log.warning("onebot_send_disconnected", self_id=self_id, group_id=group_id)
+            _log.warning("onebot_send_disconnected", self_id=self_id, **log_fields)
             raise
         except TimeoutError:
-            _log.warning("onebot_send_timeout", self_id=self_id, group_id=group_id)
-            raise OneBotSendError(
-                f"Timed out waiting for bot {self_id} to send a message"
-            ) from None
+            _log.warning("onebot_send_timeout", self_id=self_id, **log_fields)
+            raise OneBotSendError(f"Timed out waiting for bot {self_id} to {operation}") from None
         except (OSError, RuntimeError):
-            _log.warning("onebot_send_transport_failed", self_id=self_id, group_id=group_id)
-            raise OneBotSendError(f"Could not send a message through bot {self_id}") from None
+            _log.warning("onebot_send_transport_failed", self_id=self_id, **log_fields)
+            raise OneBotSendError(f"Could not {operation} through bot {self_id}") from None
         finally:
             self.pending_echoes.pop(echo, None)
             if not future.done():
@@ -296,15 +327,9 @@ class OneBotWSGateway:
                 future.exception()
 
         if response.get("status") != "ok":
-            _log.warning("onebot_send_rejected", self_id=self_id, group_id=group_id)
-            raise OneBotSendError(f"Bot {self_id} rejected the send_group_msg action")
-        try:
-            return _message_id(response["data"]["message_id"])
-        except (KeyError, TypeError, ValueError):
-            _log.warning("onebot_send_invalid_receipt", self_id=self_id, group_id=group_id)
-            raise OneBotSendError(
-                f"Bot {self_id} returned a receipt without a message ID"
-            ) from None
+            _log.warning("onebot_send_rejected", self_id=self_id, **log_fields)
+            raise OneBotSendError(f"Bot {self_id} rejected the {action} action")
+        return response
 
 
 async def _close_socket(socket: web.WebSocketResponse) -> None:
