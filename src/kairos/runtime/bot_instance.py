@@ -1,7 +1,7 @@
 """Run the group-chat pipeline for a single bot profile."""
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from functools import partial
 from time import monotonic
@@ -15,23 +15,36 @@ from kairos.harness.context_builder import ContextBuilder
 from kairos.harness.normalizer import build_roster
 from kairos.harness.postprocess import process_llm_output
 from kairos.llm import LLMConfigError, LLMRequestError, LLMResponseError
+from kairos.memory.async_worker import AsyncMemoryWorker
 from kairos.models import (
     GROUP_ERROR_PREFIX,
     GROUP_SILENCE_NOTICE,
+    ActionType,
     AuditRecord,
+    BotAction,
+    ContextSummary,
+    GateAction,
+    GateDecision,
     NormalizedMessage,
     RawGroupEvent,
     StaleAction,
+    ThreadSummary,
+    WarmMemory,
 )
-from kairos.protocols import LLMClient, MessageStore, OneBotSender
-from kairos.runtime.group_session import GroupSession
+from kairos.protocols import (
+    ContextCompactor,
+    GateHook,
+    LLMClient,
+    MessageStore,
+    OneBotSender,
+    SummaryStore,
+)
+from kairos.runtime.group_session import GroupSession, RuntimeGateHook
 from kairos.runtime.stale_check import evaluate_stale
 from kairos.telemetry.audit_logger import AuditLogger
 
 _log = structlog.get_logger(__name__)
 _GREETING_TIMEZONE = ZoneInfo("Asia/Shanghai")
-
-type RuntimeGateHook = Callable[[BotProfile, Sequence[NormalizedMessage]], Awaitable[bool]]
 
 
 def _online_greeting(hour: int) -> str:
@@ -65,7 +78,12 @@ class BotRuntime:
         llm_client: LLMClient,
         sender: OneBotSender,
         audit_logger: AuditLogger,
-        gate_hook: RuntimeGateHook | None = None,
+        gate_hook: GateHook | RuntimeGateHook | None = None,
+        *,
+        memory_worker: AsyncMemoryWorker | None = None,
+        summary_store: SummaryStore | None = None,
+        compactor: ContextCompactor | None = None,
+        owns_memory_worker: bool = True,
     ) -> None:
         self.profile = profile
         self.sessions: dict[int, GroupSession] = {}
@@ -75,6 +93,10 @@ class BotRuntime:
         self._sender = sender
         self._audit_logger = audit_logger
         self._gate_hook = gate_hook
+        self._memory_worker = memory_worker
+        self._summary_store = summary_store
+        self._compactor = compactor
+        self._owns_memory_worker = owns_memory_worker
         self._initializing: dict[int, asyncio.Lock] = {}
         self._write_locks: dict[int, asyncio.Lock] = {}
         self._writes: set[asyncio.Task[None]] = set()
@@ -146,6 +168,12 @@ class BotRuntime:
         message, _ = session.ingest_event(event, self._hosted_bot_ids)
         if message is not None:
             self._schedule_write(message)
+            if self._memory_worker is not None and (
+                self.profile.memory.enabled or self.profile.compaction.enabled
+            ):
+                self._memory_worker.on_messages_updated(
+                    self.profile, session.group_id, session.buffer
+                )
             session.schedule_trigger(
                 message,
                 partial(self._run_pipeline, session, received_at),
@@ -158,6 +186,8 @@ class BotRuntime:
             session.close()
         await asyncio.gather(*(session.wait_closed() for session in self.sessions.values()))
         await asyncio.gather(*self._writes)
+        if self._owns_memory_worker and self._memory_worker is not None:
+            await self._memory_worker.shutdown()
 
     async def _get_session(self, group_id: int) -> GroupSession | None:
         if (session := self.sessions.get(group_id)) is not None:
@@ -172,6 +202,9 @@ class BotRuntime:
             history = await self._store.load_recent_messages(
                 self.profile.bot_id, group_id, limit=self.profile.ring_buffer_size
             )
+            summaries = (
+                await self._restore_summaries(group_id) if self.profile.compaction.enabled else []
+            )
             if self._closing:
                 return None
             # PostgreSQL stores each arrival, while peer status depends on current hosting.
@@ -182,11 +215,34 @@ class BotRuntime:
                     message = message.model_copy(update={"is_peer_bot": is_peer})
                 restored.append(message)
             session = GroupSession(self.profile, group_id, self._gate_hook)
-            session.warmup(restored)
+            session.warmup(restored, summaries, compactor=self._compactor)
             self._write_locks[group_id] = asyncio.Lock()
             self.sessions[group_id] = session
             self._initializing.pop(group_id)
+            if self._memory_worker is not None:
+                if session.summaries:
+                    self._memory_worker.seed_summaries(
+                        self.profile.bot_id, group_id, session.summaries
+                    )
+                if self.profile.memory.enabled:
+                    self._memory_worker.schedule_warmup(self.profile, group_id, session.buffer)
             return session
+
+    async def _restore_summaries(self, group_id: int) -> list[ContextSummary]:
+        if self._summary_store is None or self._compactor is None:
+            return []
+        try:
+            return await self._summary_store.load_recent_summaries(
+                self.profile.bot_id, group_id, limit=self.profile.compaction.max_persisted_summaries
+            )
+        except Exception as exc:  # noqa: BLE001 - A cold summary read failure leaves raw history usable.
+            _log.warning(
+                "context_summary_restore_failed",
+                bot_id=self.profile.bot_id,
+                group_id=group_id,
+                error_type=type(exc).__name__,
+            )
+            return []
 
     def _schedule_write(self, message: NormalizedMessage) -> None:
         task = asyncio.create_task(self._persist_message(message))
@@ -238,22 +294,86 @@ class BotRuntime:
         ):
             history = [trigger_message, *history[1:]]
         trigger_seq = session.seq
-        gate_output: dict[str, bool | str] = {"allowed": allowed, "reason": gate_reason}
-        if callable(hook := session.gate_hook):
+        audit = AuditRecord(
+            bot_id=self.profile.bot_id,
+            group_id=session.group_id,
+            context_snapshot=[],
+            gate_output={"allowed": allowed, "reason": gate_reason},
+            main_vetoed=False,
+            final_reply=None,
+            stale_action="",
+            latency_ms=0,
+            created_at=datetime.now(UTC),
+        )
+        threads = (
+            session.thread_tracker.active_threads(audit.created_at)
+            if session.thread_tracker
+            else []
+        )
+        gate_decision: GateDecision | None = None
+        hook = session.gate_hook
+        if self.profile.gate.enabled and hasattr(hook, "evaluate"):
+            gate_decision = await hook.evaluate(
+                self.profile, history, threads, latest_msg=trigger_message
+            )
+            audit.gate_output.update(gate_decision.model_dump(mode="json"), l1a_reason=gate_reason)
+            if gate_decision.action is GateAction.SILENT:
+                audit.action_type = ActionType.SILENT
+                audit.stale_action = "GATE_SILENT"
+                self._finish_audit(audit, received_at)
+                return
+            if gate_decision.action is GateAction.REACT:
+                targets = _reaction_targets(history, threads, trigger_message)
+                target = gate_decision.candidate_target
+                reaction = BotAction(
+                    action=ActionType.REACT,
+                    target_msg_id=target
+                    if target is not None and target in targets
+                    else trigger_message.last_msg_id,
+                    emoji_id=gate_decision.emoji_id,
+                )
+                await self._react(session, reaction, targets, audit, received_at, "GATE_REACT")
+                return
+        elif callable(hook) and not hasattr(hook, "evaluate"):
             hook_allowed = bool(await hook(self.profile, history))
-            gate_output["hook_allowed"] = hook_allowed
+            audit.gate_output["hook_allowed"] = hook_allowed
             if not hook_allowed:
                 return
 
-        chat_messages = ContextBuilder.build_messages(self.profile, history, build_roster(history))
+        targets_history = history
+        warm_memory = None
+        if session.m2_enabled:
+            warm_memory, history = self._hot_context(session, history, threads)
+        token_budget = (
+            self.profile.compaction.input_token_budget if self.profile.compaction.enabled else None
+        )
+        chat_messages = ContextBuilder.build_messages(
+            self.profile,
+            history,
+            build_roster(history),
+            warm_memory=warm_memory,
+            gate_decision=gate_decision,
+            token_budget=token_budget,
+            enable_react=session.m2_enabled,
+        )
         result = await self._llm.chat_completion(
             self.profile.chat_model_key,
             chat_messages,
             session_id=session.llm_session_id,
         )
         processed = process_llm_output(
-            result.content, [message.content for message in history if message.is_bot]
+            result.content,
+            [message.content for message in targets_history if message.is_bot],
+            enable_react=session.m2_enabled,
         )
+        audit.context_snapshot = [message.model_dump() for message in chat_messages]
+        audit.main_vetoed = processed.vetoed
+        if session.m2_enabled:
+            audit.action_type = processed.action.action
+        if processed.action.action is ActionType.REACT:
+            targets = _reaction_targets(targets_history, threads, trigger_message)
+            await self._react(session, processed.action, targets, audit, received_at, "MAIN_REACT")
+            return
 
         reply_to = None
         if processed.vetoed:
@@ -274,7 +394,8 @@ class BotRuntime:
             action = decision.action
             reply_to = decision.reply_to_msg_id
 
-        sent: str | None = None
+        audit.stale_action = action
+        audit.target_msg_id = reply_to if session.m2_enabled else None
         try:
             if action in {StaleAction.SEND_DIRECT, StaleAction.SEND_WITH_REPLY}:
                 message_id = await self._sender.send_group_msg(
@@ -285,24 +406,16 @@ class BotRuntime:
                 )
                 if message_id is None:
                     raise OneBotSendError("Reply has no message receipt")
-                sent = processed.content
+                audit.final_reply = processed.content
+                if session.m2_enabled:
+                    session.consume_energy(self.profile.gate.energy_cost_reply)
                 self._schedule_write(
-                    session.record_bot_message(message_id, sent, datetime.now(UTC), reply_to)
+                    session.record_bot_message(
+                        message_id, processed.content, datetime.now(UTC), reply_to
+                    )
                 )
         finally:
-            self._audit_logger.log_decision(
-                AuditRecord(
-                    bot_id=self.profile.bot_id,
-                    group_id=session.group_id,
-                    context_snapshot=[message.model_dump() for message in chat_messages],
-                    gate_output=gate_output,
-                    main_vetoed=processed.vetoed,
-                    final_reply=sent,
-                    stale_action=action,
-                    latency_ms=int((monotonic() - received_at) * 1000),
-                    created_at=datetime.now(UTC),
-                )
-            )
+            self._finish_audit(audit, received_at)
         if processed.vetoed and session.group_id in self.profile.debug_groups:
             await self._send_status(
                 session.group_id,
@@ -310,3 +423,72 @@ class BotRuntime:
                 "silence_debug",
                 reply_to_msg_id=trigger_message.last_msg_id,
             )
+
+    def _hot_context(
+        self, session: GroupSession, history: list[NormalizedMessage], threads: list[ThreadSummary]
+    ) -> tuple[WarmMemory, list[NormalizedMessage]]:
+        memory = (
+            self._memory_worker.get_warm_memory(self.profile.bot_id, session.group_id)
+            if self._memory_worker is not None
+            and (self.profile.memory.enabled or self.profile.compaction.enabled)
+            else WarmMemory()
+        )
+        summaries = [*session.summaries, *memory.summaries]
+        if self._compactor is not None and memory.summaries:
+            summaries, uncovered = self._compactor.merge_restored_context(summaries, history)
+            # The cold replay already applied its watermark, including any same-time arrivals.
+            if summaries and (
+                not session.summaries
+                or summaries[-1].covered_until_msg_id != session.summaries[-1].covered_until_msg_id
+            ):
+                history = uncovered
+        return memory.model_copy(update={"summaries": summaries, "threads": threads}), history
+
+    async def _react(
+        self,
+        session: GroupSession,
+        action: BotAction,
+        targets: set[str],
+        audit: AuditRecord,
+        received_at: float,
+        source: str,
+    ) -> None:
+        audit.action_type = ActionType.REACT
+        audit.target_msg_id = action.target_msg_id
+        audit.emoji_id = action.emoji_id
+        if (
+            action.target_msg_id is None
+            or action.target_msg_id not in targets
+            or not action.emoji_id
+        ):
+            audit.stale_action = f"{source}_INVALID"
+            self._finish_audit(audit, received_at)
+            return
+
+        audit.stale_action = f"{source}_FAILED"
+        try:
+            await self._sender.set_msg_emoji_like(
+                self.profile.self_id, action.target_msg_id, action.emoji_id
+            )
+            session.consume_energy(self.profile.gate.energy_cost_react)
+            audit.stale_action = source
+        finally:
+            self._finish_audit(audit, received_at)
+
+    def _finish_audit(self, audit: AuditRecord, received_at: float) -> None:
+        audit.latency_ms = int((monotonic() - received_at) * 1000)
+        audit.created_at = datetime.now(UTC)
+        self._audit_logger.log_decision(audit)
+
+
+def _reaction_targets(
+    history: Sequence[NormalizedMessage],
+    threads: Sequence[ThreadSummary],
+    trigger: NormalizedMessage,
+) -> set[str]:
+    targets = {trigger.msg_id, trigger.last_msg_id}
+    for message in history:
+        targets.update((message.msg_id, message.last_msg_id))
+    for thread in threads:
+        targets.update((thread.root_msg_id, thread.latest_msg_id))
+    return targets
