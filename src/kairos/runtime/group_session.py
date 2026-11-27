@@ -4,7 +4,7 @@ from asyncio import Lock, Task, TimerHandle, create_task, gather, get_running_lo
 from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from time import monotonic
 from uuid import uuid4
 
@@ -48,6 +48,8 @@ class GroupSession:
         )
         self.thread_tracker = ThreadTracker() if self.m2_enabled else None
         self.summaries: list[ContextSummary] = []
+        self.context_reset_at: datetime | None = None
+        self.context_generation = 0
         self.energy = profile.gate.energy_max
         self._energy_updated_at = monotonic()
         self.buffer: deque[NormalizedMessage] = deque(maxlen=profile.ring_buffer_size)
@@ -87,7 +89,21 @@ class GroupSession:
                 for summary in summaries
                 if summary.bot_id == self.profile.bot_id and summary.group_id == self.group_id
             ]
-            self.summaries, replay = compactor.merge_restored_context(scoped_summaries, scoped)
+            marker = max(
+                (summary for summary in scoped_summaries if not summary.summary_text),
+                key=lambda summary: summary.created_at,
+                default=None,
+            )
+            if marker is not None:
+                self.context_reset_at = marker.created_at
+                scoped_summaries = [
+                    summary
+                    for summary in scoped_summaries
+                    if summary is marker
+                    or (summary.summary_text and summary.created_at > marker.created_at)
+                ]
+            ordered, replay = compactor.merge_restored_context(scoped_summaries, scoped)
+            self.summaries = [summary for summary in ordered if summary.summary_text]
             # Covered messages still identify known speakers and earlier bot receipts.
             replay_ids = {message.msg_id for message in replay}
             for message in scoped:
@@ -100,6 +116,38 @@ class GroupSession:
             if not message.is_bot:
                 self.alias_table.restore_alias(message.sender_qq, message.sender_alias)
             self._append_message(message)
+
+    def reset_context(self, keep_latest: int = 0) -> ContextSummary | None:
+        """Drop the failed context and return the cutoff for the durable replay."""
+        split = max(0, len(self.buffer) - max(0, keep_latest))
+        old, retained = list(self.buffer)[:split], list(self.buffer)[split:]
+        self.summaries.clear()
+        self.context_reset_at = now = datetime.now(UTC)
+        self.context_generation += 1
+        self.llm_session_id = f"ses_{uuid4().hex}"
+        self.buffer.clear()
+        self.buffer.extend(retained)
+        if self.thread_tracker is not None:
+            self.thread_tracker = ThreadTracker()
+            for message in retained:
+                self.thread_tracker.observe(message)
+        if self._pending is not None and all(
+            message.msg_id != self._pending.message.msg_id for message in retained
+        ):
+            self._pending = None
+            self._arm_timer()
+        if not old:
+            return None
+        tail = max(reversed(old), key=lambda message: message.latest_at)
+        return ContextSummary(
+            bot_id=self.profile.bot_id,
+            group_id=self.group_id,
+            summary_text="",
+            covered_until_msg_id=tail.last_msg_id,
+            covered_until_at=tail.latest_at,
+            token_estimate=0,
+            created_at=now,
+        )
 
     def ingest_event(
         self, event: RawGroupEvent, hosted_bot_ids: set[int]

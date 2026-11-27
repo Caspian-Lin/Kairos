@@ -2,9 +2,11 @@
 
 import asyncio
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from time import monotonic
+from typing import Any, Literal
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -12,6 +14,7 @@ import structlog
 from kairos.config import BotProfile
 from kairos.gateway.onebot_ws import OneBotSendError
 from kairos.harness.context_builder import ContextBuilder
+from kairos.harness.gate import ModelGate
 from kairos.harness.normalizer import build_roster
 from kairos.harness.postprocess import process_llm_output
 from kairos.llm import LLMConfigError, LLMRequestError, LLMResponseError
@@ -26,9 +29,12 @@ from kairos.models import (
     GateAction,
     GateDecision,
     NormalizedMessage,
+    PipelineStep,
+    PipelineTrace,
     RawGroupEvent,
     StaleAction,
     ThreadSummary,
+    ToolDefinition,
     WarmMemory,
 )
 from kairos.protocols import (
@@ -38,10 +44,12 @@ from kairos.protocols import (
     MessageStore,
     OneBotSender,
     SummaryStore,
+    ToolRegistryProtocol,
 )
 from kairos.runtime.group_session import GroupSession, RuntimeGateHook
 from kairos.runtime.stale_check import evaluate_stale
 from kairos.telemetry.audit_logger import AuditLogger
+from kairos.telemetry.trace_store import PipelineTraceStore
 
 _log = structlog.get_logger(__name__)
 _GREETING_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -69,6 +77,78 @@ def _group_error_detail(error: Exception) -> str:
     return f"群消息处理失败（{type(error).__name__}）。"
 
 
+_TRACE_STAGES = (
+    "L0_ingest",
+    "L1a_rule_gate",
+    "L1b_model_gate",
+    "hot_memory_and_tools",
+    "L2_context_build",
+    "main_llm",
+    "postprocess",
+    "L3_stale_check",
+    "dispatch",
+)
+
+
+class _TurnTrace:
+    def __init__(
+        self,
+        enabled: bool,
+        message: NormalizedMessage,
+        received_at: float,
+        ingested_ms: int,
+    ) -> None:
+        self.trace = None
+        self.active: str | None = None
+        self.started = received_at
+        self.received_at = received_at
+        if enabled:
+            self.trace = PipelineTrace(
+                trace_id=uuid4().hex,
+                bot_id=message.bot_id,
+                group_id=message.group_id,
+                msg_id=message.last_msg_id,
+                sender_alias=message.sender_alias,
+                input_preview=message.content[:320],
+                started_at=datetime.now(UTC) - timedelta(seconds=max(0, monotonic() - received_at)),
+                steps=[PipelineStep(stage="L0_ingest", status="ok", latency_ms=ingested_ms)],
+            )
+
+    def start(self, stage: str) -> None:
+        if self.trace is not None:
+            self.active = stage
+            self.started = monotonic()
+
+    def end(
+        self, status: Literal["ok", "skipped", "filtered", "error"] = "ok", **detail: Any
+    ) -> None:
+        if self.trace is not None and self.active is not None:
+            self.trace.steps.append(
+                PipelineStep(
+                    stage=self.active,
+                    status=status,
+                    latency_ms=int((monotonic() - self.started) * 1000),
+                    detail=detail,
+                )
+            )
+            self.active = None
+
+    def finish(self, outcome: str, store: PipelineTraceStore | None) -> None:
+        if self.trace is None or store is None:
+            return
+        self.trace.outcome = outcome
+        self.trace.total_latency_ms = int((monotonic() - self.received_at) * 1000)
+        steps = {step.stage: step for step in self.trace.steps}
+        self.trace.steps = [
+            steps[stage] if stage in steps else PipelineStep(stage=stage, status="skipped")
+            for stage in _TRACE_STAGES
+        ]
+        try:
+            store.record(self.trace)
+        except Exception as exc:  # noqa: BLE001 - Telemetry cannot interrupt message processing.
+            _log.warning("pipeline_trace_write_failed", error_type=type(exc).__name__)
+
+
 class BotRuntime:
     def __init__(
         self,
@@ -84,6 +164,8 @@ class BotRuntime:
         summary_store: SummaryStore | None = None,
         compactor: ContextCompactor | None = None,
         owns_memory_worker: bool = True,
+        tool_registry: ToolRegistryProtocol | None = None,
+        trace_store: PipelineTraceStore | None = None,
     ) -> None:
         self.profile = profile
         self.sessions: dict[int, GroupSession] = {}
@@ -97,6 +179,8 @@ class BotRuntime:
         self._summary_store = summary_store
         self._compactor = compactor
         self._owns_memory_worker = owns_memory_worker
+        self._tool_registry = tool_registry
+        self._trace_store = trace_store
         self._initializing: dict[int, asyncio.Lock] = {}
         self._write_locks: dict[int, asyncio.Lock] = {}
         self._writes: set[asyncio.Task[None]] = set()
@@ -176,7 +260,12 @@ class BotRuntime:
                 )
             session.schedule_trigger(
                 message,
-                partial(self._run_pipeline, session, received_at),
+                partial(
+                    self._run_pipeline,
+                    session,
+                    received_at,
+                    int((monotonic() - received_at) * 1000) if self._trace_store is not None else 0,
+                ),
                 buffered=session.buffer[-1],
             )
 
@@ -266,19 +355,33 @@ class BotRuntime:
         self,
         session: GroupSession,
         received_at: float,
+        ingested_ms: int,
         trigger_message: NormalizedMessage,
     ) -> None:
-        async with session.pipeline_lock:
-            try:
-                await self._process_trigger(session, received_at, trigger_message)
-            except Exception as error:
-                await self._report_group_error(session.group_id, trigger_message.last_msg_id, error)
-                raise
+        trace = _TurnTrace(self._trace_store is not None, trigger_message, received_at, ingested_ms)
+        outcome = "CANCELLED"
+        try:
+            async with session.pipeline_lock:
+                outcome = await self._process_trigger(session, received_at, trigger_message, trace)
+        except Exception as error:
+            outcome = "ERROR"
+            trace.end("error", error_type=type(error).__name__)
+            await self._report_group_error(session.group_id, trigger_message.last_msg_id, error)
+            raise
+        finally:
+            trace.finish(outcome, self._trace_store)
 
     async def _process_trigger(
-        self, session: GroupSession, received_at: float, trigger_message: NormalizedMessage
-    ) -> None:
+        self,
+        session: GroupSession,
+        received_at: float,
+        trigger_message: NormalizedMessage,
+        trace: _TurnTrace,
+    ) -> str:
+        trace.start("L1a_rule_gate")
+        generation = session.context_generation
         allowed, gate_reason = session.evaluate_l1a_gate(trigger_message, monotonic())
+        trace.end("ok" if allowed else "filtered", reason=gate_reason)
         if not allowed:
             _log.debug(
                 "group_trigger_filtered",
@@ -286,7 +389,7 @@ class BotRuntime:
                 group_id=session.group_id,
                 reason=gate_reason,
             )
-            return
+            return "FILTERED"
 
         history = list(session.buffer)
         if trigger_message.addresses_bot and all(
@@ -312,16 +415,32 @@ class BotRuntime:
         )
         gate_decision: GateDecision | None = None
         hook = session.gate_hook
+        trace.start("L1b_model_gate")
+        registry = self._tool_registry if self.profile.enabled_tools else None
         if self.profile.gate.enabled and isinstance(hook, GateHook):
-            gate_decision = await hook.evaluate(
-                self.profile, history, threads, latest_msg=trigger_message
+            catalog = registry.catalog_prompt(self.profile) if registry is not None else ""
+            if catalog and isinstance(hook, ModelGate):
+                gate_decision = await hook.evaluate(
+                    self.profile, history, threads, latest_msg=trigger_message, tool_catalog=catalog
+                )
+            else:
+                gate_decision = await hook.evaluate(
+                    self.profile, history, threads, latest_msg=trigger_message
+                )
+            trace.end(
+                "filtered" if gate_decision.action is GateAction.SILENT else "ok",
+                action=gate_decision.action,
+                reason=gate_decision.reason,
+                need_tools=gate_decision.need_tools,
             )
+            if generation != session.context_generation:
+                return "CONTEXT_RESET"
             audit.gate_output.update(gate_decision.model_dump(mode="json"), l1a_reason=gate_reason)
             if gate_decision.action is GateAction.SILENT:
                 audit.action_type = ActionType.SILENT
                 audit.stale_action = "GATE_SILENT"
                 self._finish_audit(audit, received_at)
-                return
+                return audit.stale_action
             if gate_decision.action is GateAction.REACT:
                 targets = _reaction_targets(history, threads, trigger_message)
                 target = gate_decision.candidate_target
@@ -332,57 +451,116 @@ class BotRuntime:
                     else trigger_message.last_msg_id,
                     emoji_id=gate_decision.emoji_id,
                 )
+                trace.start("dispatch")
                 await self._react(session, reaction, targets, audit, received_at, "GATE_REACT")
-                return
+                trace.end(
+                    "ok" if audit.stale_action == "GATE_REACT" else "error",
+                    action=audit.stale_action,
+                    target_msg_id=audit.target_msg_id,
+                    emoji_id=audit.emoji_id,
+                )
+                return audit.stale_action
         elif callable(hook) and not isinstance(hook, GateHook):
             hook_allowed = bool(await hook(self.profile, history))
             audit.gate_output["hook_allowed"] = hook_allowed
+            trace.end("ok" if hook_allowed else "filtered", allowed=hook_allowed)
             if not hook_allowed:
-                return
+                return "FILTERED"
+        else:
+            trace.end("skipped")
 
+        trace.start("hot_memory_and_tools")
+        tools = (
+            registry.resolve_definitions(self.profile, gate_decision.need_tools)
+            if registry is not None and gate_decision is not None and gate_decision.need_tools
+            else []
+        )
         targets_history = history
         warm_memory = None
         if session.m2_enabled:
             warm_memory, history = self._hot_context(session, history, threads)
+        trace.end(attached_tools=[tool.name for tool in tools], warm=warm_memory is not None)
+        trace.start("L2_context_build")
         token_budget = (
             self.profile.compaction.input_token_budget if self.profile.compaction.enabled else None
         )
+        roster = build_roster(history)
         chat_messages = ContextBuilder.build_messages(
             self.profile,
             history,
-            build_roster(history),
+            roster,
             warm_memory=warm_memory,
             gate_decision=gate_decision,
             token_budget=token_budget,
             enable_react=session.m2_enabled,
         )
+        if trace.trace is not None:
+            try:
+                trace.trace.request_context = ContextBuilder.inspect_context(
+                    self.profile,
+                    history,
+                    roster,
+                    token_budget=token_budget,
+                    attached_tools=tools,
+                    request_messages=chat_messages,
+                )
+            except Exception as exc:  # noqa: BLE001 - Request inspection is optional telemetry.
+                _log.warning("pipeline_context_inspection_failed", error_type=type(exc).__name__)
+        trace.end(turns=len(chat_messages))
+        trace.start("main_llm")
+        overrides: dict[str, list[ToolDefinition]] = {"tools": tools} if tools else {}
         result = await self._llm.chat_completion(
             self.profile.chat_model_key,
             chat_messages,
             session_id=session.llm_session_id,
+            **overrides,
         )
+        trace.end(model=result.model, tool_calls=[call.name for call in result.tool_calls])
+        if generation != session.context_generation:
+            return "CONTEXT_RESET"
+        trace.start("postprocess")
+        available_tools = {tool.name for tool in tools}
+        if not result.content.strip() and any(
+            call.name in available_tools for call in result.tool_calls
+        ):
+            trace.end("skipped", reason="tool_request")
+            return "TOOL_REQUESTED"
         processed = process_llm_output(
             result.content,
             [message.content for message in targets_history if message.is_bot],
             enable_react=session.m2_enabled,
         )
+        if not (
+            processed.content
+            or processed.vetoed
+            or processed.repeated_dropped
+            or processed.action.action is ActionType.REACT
+        ):
+            raise LLMResponseError("Model returned empty chat output")
+        trace.end(action=processed.action.action, repeated=processed.repeated_dropped)
         audit.context_snapshot = [message.model_dump() for message in chat_messages]
         audit.main_vetoed = processed.vetoed
         if session.m2_enabled:
             audit.action_type = processed.action.action
         if processed.action.action is ActionType.REACT:
             targets = _reaction_targets(targets_history, threads, trigger_message)
+            trace.start("dispatch")
             await self._react(session, processed.action, targets, audit, received_at, "MAIN_REACT")
-            return
+            trace.end(
+                "ok" if audit.stale_action == "MAIN_REACT" else "error",
+                action=audit.stale_action,
+                target_msg_id=audit.target_msg_id,
+                emoji_id=audit.emoji_id,
+            )
+            return audit.stale_action
 
         reply_to = None
         if processed.vetoed:
             action = "VETOED"
         elif processed.repeated_dropped:
             action = "DROPPED_REPEAT"
-        elif not processed.content:
-            raise LLMResponseError("Model returned empty chat output")
         else:
+            trace.start("L3_stale_check")
             stale = self.profile.stale_check
             decision = evaluate_stale(
                 trigger_seq,
@@ -393,11 +571,17 @@ class BotRuntime:
             )
             action = decision.action
             reply_to = decision.reply_to_msg_id
+            trace.end(
+                "filtered" if action is StaleAction.DROP_STALE else "ok",
+                delta=decision.delta,
+                action=action,
+            )
 
         audit.stale_action = action
         audit.target_msg_id = reply_to if session.m2_enabled else None
         try:
             if action in {StaleAction.SEND_DIRECT, StaleAction.SEND_WITH_REPLY}:
+                trace.start("dispatch")
                 message_id = await self._sender.send_group_msg(
                     self.profile.self_id,
                     session.group_id,
@@ -414,15 +598,36 @@ class BotRuntime:
                         message_id, processed.content, datetime.now(UTC), reply_to
                     )
                 )
+                trace.end(action=action, message_id=message_id)
         finally:
             self._finish_audit(audit, received_at)
         if processed.vetoed and session.group_id in self.profile.debug_groups:
+            trace.start("dispatch")
             await self._send_status(
                 session.group_id,
                 GROUP_SILENCE_NOTICE,
                 "silence_debug",
                 reply_to_msg_id=trigger_message.last_msg_id,
             )
+            trace.end(action="silence_debug")
+        return action
+
+    def reset_group_context(
+        self,
+        group_id: int,
+        batch: Sequence[NormalizedMessage],
+    ) -> ContextSummary | None:
+        session = self.sessions.get(group_id)
+        if session is None or not batch:
+            return None
+        old_ids = {message.msg_id for message in batch}
+        cutoff = max(message.latest_at for message in batch)
+        keep = 0
+        for message in reversed(session.buffer):
+            if message.msg_id in old_ids or message.created_at < cutoff:
+                break
+            keep += 1
+        return session.reset_context(keep_latest=keep)
 
     def _hot_context(
         self, session: GroupSession, history: list[NormalizedMessage], threads: list[ThreadSummary]
@@ -433,8 +638,14 @@ class BotRuntime:
             and (self.profile.memory.enabled or self.profile.compaction.enabled)
             else WarmMemory()
         )
-        summaries = [*session.summaries, *memory.summaries]
-        if self._compactor is not None and memory.summaries:
+        cached = [
+            summary
+            for summary in memory.summaries
+            if summary.summary_text
+            and (session.context_reset_at is None or summary.created_at > session.context_reset_at)
+        ]
+        summaries = [*session.summaries, *cached]
+        if self._compactor is not None and cached:
             summaries, uncovered = self._compactor.merge_restored_context(summaries, history)
             # The cold replay already applied its watermark, including any same-time arrivals.
             if summaries and (

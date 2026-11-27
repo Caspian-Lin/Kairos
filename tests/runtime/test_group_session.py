@@ -331,3 +331,36 @@ async def test_close_cancels_waiting_and_running_triggers(session: GroupSession)
     await asyncio.sleep(0)
     assert cleaned.is_set()
     unexpected.assert_not_called()
+
+
+def test_reset_keeps_only_newer_messages_in_memory_and_after_restore(session: GroupSession) -> None:
+    profile = session.profile.model_copy(deep=True)
+    profile.compaction.enabled = True
+    group = GroupSession(profile, _GROUP)
+    old = _ingest(group, 1, "旧上下文")
+    latest = _ingest(group, 2, "新上下文", _USER + 1)
+    historical = ContextSummary(
+        bot_id=profile.bot_id,
+        group_id=_GROUP,
+        summary_text="旧摘要",
+        covered_until_msg_id="0",
+        covered_until_at=_NOW,
+        created_at=_NOW,
+        token_estimate=3,
+    )
+    group.summaries.append(historical)
+    session_id = group.llm_session_id
+
+    marker = group.reset_context(keep_latest=1)
+
+    assert marker is not None and marker.covered_until_msg_id == old.msg_id
+    assert group.summaries == [] and list(group.buffer) == [latest]
+    assert group.llm_session_id != session_id
+    assert group.context_generation == 1 and group.seq == 2
+    rebuilt = GroupSession(profile, _GROUP)
+    rebuilt.warmup(
+        [old, latest],
+        [historical, marker],
+        compactor=DefaultContextCompactor(AsyncMock(spec=LLMClient)),
+    )
+    assert rebuilt.summaries == [] and list(rebuilt.buffer) == [latest]

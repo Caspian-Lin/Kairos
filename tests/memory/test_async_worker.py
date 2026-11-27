@@ -5,7 +5,13 @@ from unittest.mock import AsyncMock, Mock
 
 from kairos.config import BotProfile, CompactionConfig, MemoryConfig
 from kairos.memory.async_worker import AsyncMemoryWorker, HotContextCache
-from kairos.models import ContextSummary, LLMResult, NormalizedMessage, WarmMemory
+from kairos.models import (
+    CompactionOutcome,
+    ContextSummary,
+    LLMResult,
+    NormalizedMessage,
+    WarmMemory,
+)
 from kairos.protocols import ContextCompactor, LLMClient, MemoryProvider, MemoryStore, SummaryStore
 
 _AT = datetime(2026, 11, 27, tzinfo=UTC)
@@ -142,7 +148,9 @@ async def test_compaction_persists_new_summary_even_if_recall_fails() -> None:
     compactor = Mock(spec=ContextCompactor)
     compactor.should_compact.return_value = True
     summary = _summary(3)
-    compactor.compact.return_value = summary
+    compactor.compact_with_outcome.return_value = CompactionOutcome(
+        status="succeeded", summary=summary, attempts=1
+    )
     profile = _profile(compaction=True)
     worker = AsyncMemoryWorker(provider, summary_store=store, compactor=compactor)
     old = [_summary(1), _summary(2)]
@@ -151,7 +159,9 @@ async def test_compaction_persists_new_summary_even_if_recall_fails() -> None:
     await _finish_work(worker)
 
     provider.recall.assert_awaited_once()
-    compactor.compact.assert_awaited_once_with(profile, 10, (_message(3), _message(4)), old)
+    compactor.compact_with_outcome.assert_awaited_once_with(
+        profile, 10, (_message(3), _message(4)), old
+    )
     store.save_summary.assert_awaited_once_with(summary)
     assert worker.get_warm_memory("bot", 10).summaries == [old[-1], summary]
     await worker.shutdown()
@@ -250,3 +260,33 @@ async def test_shutdown_cancels_active_and_queued_work() -> None:
     worker.schedule_warmup(profile, 12, [])
     worker.on_messages_updated(profile, 10, [_message(3)])
     assert not worker._groups and provider.recall.await_count == 1
+
+
+async def test_failed_compaction_clears_old_summaries_and_prevents_refill() -> None:
+    provider = AsyncMock(spec=MemoryProvider)
+    provider.recall.return_value = WarmMemory(summaries=[_summary(1)])
+    compactor = Mock(spec=ContextCompactor)
+    compactor.should_compact.side_effect = [True, False]
+    compactor.compact_with_outcome.return_value = CompactionOutcome(
+        status="reset_required", attempts=3
+    )
+    marker = _summary(2).model_copy(update={"summary_text": "", "token_estimate": 0})
+    reset = Mock(return_value=marker)
+    store = AsyncMock(spec=SummaryStore)
+    worker = AsyncMemoryWorker(
+        provider, summary_store=store, compactor=compactor, on_context_reset=reset
+    )
+    profile = _profile(compaction=True)
+    batch = [_message(1), _message(2)]
+    worker.seed_summaries("bot", 10, [_summary(1)])
+    try:
+        worker.on_messages_updated(profile, 10, batch)
+        await _finish_work(worker)
+        reset.assert_called_once_with("bot", 10, tuple(batch))
+        store.save_summary.assert_awaited_once_with(marker)
+        assert worker.get_warm_memory("bot", 10).summaries == []
+        worker.on_messages_updated(profile, 10, [_message(3), _message(4), _message(5)])
+        await _finish_work(worker)
+        assert worker.get_warm_memory("bot", 10).summaries == []
+    finally:
+        await worker.shutdown()

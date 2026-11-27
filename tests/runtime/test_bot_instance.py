@@ -8,12 +8,21 @@ from itertools import count
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from aiohttp import ClientSession
 from conftest import FakeSender, FakeStore
 from structlog.testing import capture_logs
 
 from kairos import main as entry_point
-from kairos.config import BotProfile, DebounceConfig, GlobalConfig, PostgresConfig, RateLimitConfig
-from kairos.gateway.onebot_ws import OneBotSendError
+from kairos.config import (
+    BotProfile,
+    DebounceConfig,
+    GlobalConfig,
+    OneBotWSConfig,
+    PostgresConfig,
+    RateLimitConfig,
+)
+from kairos.gateway.onebot_ws import OneBotSendError, OneBotWSGateway
+from kairos.harness.tool_registry import ToolRegistry
 from kairos.llm import LLMRequestError
 from kairos.main import MultiBotManager
 from kairos.models import (
@@ -24,10 +33,13 @@ from kairos.models import (
     MessageSegment,
     NormalizedMessage,
     RawGroupEvent,
+    ToolDefinition,
+    ToolSpec,
 )
 from kairos.protocols import LLMClient
 from kairos.runtime import bot_instance
 from kairos.telemetry.audit_logger import AuditLogger
+from kairos.telemetry.trace_store import PipelineTraceStore
 
 _GROUP = 900
 _TIME = datetime(2026, 1, 2, tzinfo=UTC)
@@ -117,7 +129,11 @@ def _history(msg_id: str, sender: int, alias: str, text: str) -> NormalizedMessa
 
 class _RuntimeCase:
     def __init__(
-        self, profiles: Sequence[BotProfile], bot_clients: Mapping[str, LLMClient] | None = None
+        self,
+        profiles: Sequence[BotProfile],
+        bot_clients: Mapping[str, LLMClient] | None = None,
+        *,
+        registry: ToolRegistry | None = None,
     ) -> None:
         self.store = FakeStore()
         self.audit_records: asyncio.Queue[AuditRecord] = asyncio.Queue()
@@ -136,6 +152,7 @@ class _RuntimeCase:
 
         self.sender.send_group_msg.side_effect = acknowledge
         self.audit = AuditLogger(self.store)
+        self.traces = PipelineTraceStore()
         self.manager = MultiBotManager(
             profiles,
             self.store,
@@ -145,6 +162,8 @@ class _RuntimeCase:
             bot_llm_clients=bot_clients,
             summary_store=self.store,
             memory_store=self.store,
+            tool_registry=registry,
+            trace_store=self.traces,
         )
 
     async def next_audit(self) -> AuditRecord:
@@ -156,9 +175,12 @@ async def make_case() -> AsyncIterator[Callable[[Sequence[BotProfile]], _Runtime
     async with AsyncExitStack() as resources:
 
         def create(
-            profiles: Sequence[BotProfile], bot_clients: Mapping[str, LLMClient] | None = None
+            profiles: Sequence[BotProfile],
+            bot_clients: Mapping[str, LLMClient] | None = None,
+            *,
+            registry: ToolRegistry | None = None,
         ) -> _RuntimeCase:
-            case = _RuntimeCase(profiles, bot_clients)
+            case = _RuntimeCase(profiles, bot_clients, registry=registry)
             resources.push_async_callback(case.audit.drain)
             resources.push_async_callback(case.manager.shutdown)
             return case
@@ -680,9 +702,9 @@ async def test_m1_uses_only_existing_calls_and_preserves_literal_action_text(mak
     case.sender.set_msg_emoji_like.assert_not_awaited()
 
 
-@pytest.mark.parametrize("start_fails", [False, True])
+@pytest.mark.parametrize("start_fails, restart", [(False, False), (True, False), (False, True)])
 async def test_main_cleans_up_in_order_after_signal_or_start_failure(
-    monkeypatch: pytest.MonkeyPatch, start_fails: bool
+    monkeypatch: pytest.MonkeyPatch, start_fails: bool, restart: bool
 ) -> None:
     order: list[str] = []
     signals: dict[signal.Signals, Callable[[], None]] = {}
@@ -695,11 +717,16 @@ async def test_main_cleans_up_in_order_after_signal_or_start_failure(
         mock = AsyncMock(side_effect=lambda: order.append(name))
         return mock
 
+    controller = entry_point.RestartController(lambda: order.append("restart"))
+
     def start() -> None:
         order.append("ws.start")
         if start_fails:
             raise OSError("Cannot bind mock gateway")
-        signals[signal.SIGTERM]()
+        if restart:
+            controller.request_restart()
+        else:
+            signals[signal.SIGTERM]()
 
     def router(*_args) -> Mock:
         order.append("llm.create")
@@ -732,9 +759,9 @@ async def test_main_cleans_up_in_order_after_signal_or_start_failure(
 
     if start_fails:
         with pytest.raises(OSError, match="Cannot bind mock gateway"):
-            await entry_point.run(config, [_profile()])
+            await entry_point.run(config, [_profile()], restart_controller=controller)
     else:
-        await entry_point.run(config, [_profile()])
+        await entry_point.run(config, [_profile()], restart_controller=controller)
 
     assert order == [
         "pg.connect",
@@ -746,5 +773,135 @@ async def test_main_cleans_up_in_order_after_signal_or_start_failure(
         "audit.drain",
         "llm.close",
         "pg.close",
-    ]
+    ] + (["restart"] if restart else [])
     assert not signals
+
+
+@pytest.mark.parametrize("requested", [False, True])
+async def test_dynamic_tool_gating_and_trace_request_context(make_case, requested: bool) -> None:
+    profile = _gated_profile()
+    profile.enabled_tools = ["lookup"]
+    tool = ToolDefinition(
+        name="lookup", description="Look up a note", parameters={"type": "object"}
+    )
+    registry = ToolRegistry([ToolSpec(definition=tool, catalog_hint="Find a stored note")])
+    case = make_case([profile], registry=registry)
+    need_tools = ["lookup", "unexpected"] if requested else []
+    case.llm.chat_completion.side_effect = [
+        _result(json.dumps({"action": "pass", "need_tools": need_tools})),
+        _result(),
+    ]
+    await case.manager.handle_group_event(_event("10"))
+    await case.next_audit()
+    calls = case.llm.chat_completion.await_args_list
+    assert "lookup: Find a stored note" in calls[0].args[1][0].content
+    if requested:
+        assert calls[1].kwargs["tools"] == [tool]
+    else:
+        assert "tools" not in calls[1].kwargs
+    (trace,) = case.traces.list_recent()
+    assert trace.outcome == "SEND_DIRECT"
+    assert [step.stage for step in trace.steps] == list(bot_instance._TRACE_STAGES)
+    assert all(step.status == "ok" and step.latency_ms >= 0 for step in trace.steps)
+    assert trace.request_context is not None
+    assert trace.request_context["attached_tools"] == ([tool.model_dump()] if requested else [])
+    assert trace.request_context["turns"][0]["role"] == "user"
+
+
+@pytest.mark.parametrize("mode", ["filtered", "silent", "react", "error"])
+async def test_tracing_keeps_short_circuits_and_errors(make_case, mode: str) -> None:
+    profile = _gated_profile()
+    if mode == "filtered":
+        profile.trigger_mode = "mention_only"
+    case = make_case([profile])
+    if mode in {"silent", "react"}:
+        case.llm.chat_completion.return_value = _result(
+            json.dumps({"action": mode, "candidate_target": "10", "emoji_id": "76"})
+        )
+    if mode == "error":
+        case.llm.chat_completion.side_effect = [_result('{"action":"pass"}'), OSError("offline")]
+    await case.manager.handle_group_event(_event("10"))
+    async with asyncio.timeout(2):
+        while not case.traces.list_recent():
+            await asyncio.sleep(0)
+    (trace,) = case.traces.list_recent()
+    assert (
+        trace.outcome
+        == {
+            "filtered": "FILTERED",
+            "silent": "GATE_SILENT",
+            "react": "GATE_REACT",
+            "error": "ERROR",
+        }[mode]
+    )
+    assert [step.stage for step in trace.steps] == list(bot_instance._TRACE_STAGES)
+    assert (trace.request_context is not None) is (mode == "error")
+
+
+async def test_reload_switches_profile_on_same_websocket_and_rolls_back(make_case) -> None:
+    old, new = _profile(), _profile("second", 1)
+    case = make_case([old])
+    gateway = OneBotWSGateway(OneBotWSConfig(port=0), case.manager.handle_group_event)
+    await gateway.start()
+    try:
+        async with (
+            ClientSession() as client,
+            client.ws_connect(
+                f"http://127.0.0.1:{gateway.port}{gateway.config.path}",
+                headers={"X-Self-ID": "1"},
+            ) as socket,
+        ):
+            original = case.manager.runtimes[1]
+            with pytest.raises(ValueError, match="distinct"):
+                await case.manager.reload_profiles([old, new], {})
+            assert case.manager.runtimes[1] is original
+            await case.manager.reload_profiles([new], {})
+            assert case.manager.runtimes[1].profile.bot_id == "second"
+            assert gateway.connected_self_ids == {1}
+            await socket.send_json(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "group_id": _GROUP,
+                    "message_id": 10,
+                    "user_id": 42,
+                    "time": int(_TIME.timestamp()),
+                    "message": "你好",
+                }
+            )
+            audit = await case.next_audit()
+            assert audit.bot_id == "second" and audit.stale_action == "SEND_DIRECT"
+            assert not socket.closed
+    finally:
+        await gateway.stop()
+
+
+async def test_three_compaction_failures_reset_the_runtime_context(make_case) -> None:
+    profile = _profile()
+    profile.trigger_mode = "mention_only"
+    profile.ring_buffer_size = 2
+    profile.worker_model_key = "worker"
+    profile.compaction.enabled = True
+    profile.compaction.keep_recent_messages = 1
+    case = make_case([profile])
+
+    async def reply(model: str, *_args: object, **_kwargs: object) -> LLMResult:
+        return _result("") if model == "worker" else _result()
+
+    case.llm.chat_completion.side_effect = reply
+    await case.manager.handle_group_event(_event("11", text="旧对话甲"))
+    await case.manager.handle_group_event(_event("12", sender=43, text="旧对话乙"))
+    async with asyncio.timeout(2):
+        while not case.store.save_summary.await_count:
+            await asyncio.sleep(0)
+    session = case.manager.runtimes[1].sessions[_GROUP]
+    assert session.context_generation == 1 and not session.buffer and not session.summaries
+    (marker,) = case.store.save_summary.await_args.args
+    assert marker.covered_until_msg_id == "12" and marker.summary_text == ""
+    assert [call.args[0] for call in case.llm.chat_completion.await_args_list] == ["worker"] * 3
+
+    await case.manager.handle_group_event(_event("13", mention=True, text="新对话"))
+    audit = await case.next_audit()
+    assert audit.final_reply == _REPLY
+    assert "新对话" in audit.context_snapshot[-1]["content"]
+    assert all("旧对话" not in turn["content"] for turn in audit.context_snapshot)
