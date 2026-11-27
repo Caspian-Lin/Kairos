@@ -33,7 +33,7 @@ target-version = "py312"
 extend-select = ["I"]
 
 [tool.ruff.format]
-exclude = ["Kairos_设计文档/**"]
+exclude = ["docs/Kairos_设计文档/**"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

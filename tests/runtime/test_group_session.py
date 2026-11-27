@@ -27,6 +27,7 @@ async def session() -> AsyncIterator[GroupSession]:
         nickname="助手",
         persona_prompt="",
         chat_model_key="chat",
+        trigger_mode="all_with_veto",
         ring_buffer_size=3,
     )
     group = GroupSession(profile, _GROUP)
@@ -140,7 +141,7 @@ def test_l1a_caps_peer_turns_until_human_message(session: GroupSession) -> None:
     assert session.evaluate_l1a_gate(peer_after_human, 105) == (True, "pass")
 
 
-@pytest.mark.parametrize("direct_flag", ["is_at_bot", "is_reply_to_bot"])
+@pytest.mark.parametrize("direct_flag", ["is_at_bot", "is_reply_to_bot", "mentions_bot_name"])
 async def test_debounce_deadlines(
     session: GroupSession, monkeypatch: pytest.MonkeyPatch, direct_flag: str
 ) -> None:
@@ -153,7 +154,7 @@ async def test_debounce_deadlines(
     ordinary = _ingest(session, 1, "你好")
     addressed = ordinary.model_copy(update={direct_flag: True})
 
-    async def callback() -> None:
+    async def callback(*_args: object) -> None:
         pass
 
     session.schedule_trigger(ordinary, callback)
@@ -181,7 +182,7 @@ async def test_debounce_fires_once_when_ordinary_stream_reaches_hard_deadline(
     triggered = asyncio.Event()
     calls: list[float] = []
 
-    async def callback() -> None:
+    async def callback(*_args: object) -> None:
         calls.append(now)
         triggered.set()
 
@@ -202,15 +203,15 @@ async def test_active_callback_coalesces_waiters_into_one_latest_trigger(
     next_run = asyncio.Event()
     calls: list[str] = []
 
-    async def first() -> None:
+    async def first(*_args: object) -> None:
         calls.append("first")
         started.set()
         await release.wait()
 
-    async def superseded() -> None:
+    async def superseded(*_args: object) -> None:
         calls.append("superseded")
 
-    async def latest() -> None:
+    async def latest(*_args: object) -> None:
         calls.append("latest")
         next_run.set()
 
@@ -233,7 +234,7 @@ async def test_close_cancels_waiting_and_running_triggers(session: GroupSession)
     started = asyncio.Event()
     cleaned = asyncio.Event()
 
-    async def running() -> None:
+    async def running(*_args: object) -> None:
         try:
             started.set()
             await asyncio.Event().wait()
@@ -243,7 +244,7 @@ async def test_close_cancels_waiting_and_running_triggers(session: GroupSession)
 
     unexpected = Mock()
 
-    async def waiting() -> None:
+    async def waiting(*_args: object) -> None:
         unexpected()
 
     without_active_callback = GroupSession(session.profile, _GROUP)

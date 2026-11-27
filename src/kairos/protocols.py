@@ -25,7 +25,12 @@ class MessageStore(Protocol):
 
 class LLMClient(Protocol):
     async def chat_completion(
-        self, model_key: str, messages: list[ChatMessage], **overrides: Any
+        self,
+        model_key: str,
+        messages: list[ChatMessage],
+        *,
+        session_id: str | None = None,
+        **overrides: Any,
     ) -> LLMResult: ...
 
 

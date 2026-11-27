@@ -4,13 +4,14 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from itertools import count
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from structlog.testing import capture_logs
 
 from kairos import main as entry_point
 from kairos.config import BotProfile, DebounceConfig, GlobalConfig, PostgresConfig, RateLimitConfig
+from kairos.llm import LLMRequestError
 from kairos.main import MultiBotManager
 from kairos.models import AuditRecord, LLMResult, MessageSegment, NormalizedMessage, RawGroupEvent
 from kairos.protocols import LLMClient, MessageStore, OneBotSender
@@ -22,6 +23,23 @@ _TIME = datetime(2026, 1, 2, tzinfo=UTC)
 _REPLY = "收到，下次见。"
 
 
+@pytest.mark.parametrize(
+    ("hour", "greeting"),
+    [
+        (0, "晚上好"),
+        (4, "晚上好"),
+        (5, "早上好"),
+        (10, "早上好"),
+        (11, "中午好"),
+        (17, "中午好"),
+        (18, "晚上好"),
+        (23, "晚上好"),
+    ],
+)
+def test_online_greeting_time_buckets(hour: int, greeting: str) -> None:
+    assert bot_instance._online_greeting(hour) == greeting
+
+
 def _profile(bot_id: str = "first", self_id: int = 1) -> BotProfile:
     return BotProfile(
         bot_id=bot_id,
@@ -29,6 +47,7 @@ def _profile(bot_id: str = "first", self_id: int = 1) -> BotProfile:
         nickname=f"昵称 {bot_id}",
         persona_prompt=f"独立人设 {bot_id}",
         chat_model_key=f"{bot_id}-model",
+        trigger_mode="all_with_veto",
         debounce=DebounceConfig(normal_seconds=0, mention_seconds=0, max_wait_seconds=0),
         rate_limit=RateLimitConfig(cooldown_seconds=0),
     )
@@ -136,6 +155,9 @@ async def test_reply_echo_updates_history_store_and_audit(make_case) -> None:
     assert [call.args[0] for call in case.store.save_message.await_args_list] == list(history)
     key, messages = case.llm.chat_completion.await_args.args
     assert key == "first-model"
+    assert case.llm.chat_completion.await_args.kwargs["session_id"] == (
+        case.manager.runtimes[1].sessions[_GROUP].llm_session_id
+    )
     assert [message.role for message in messages] == ["system", "user"]
     assert record.context_snapshot == [message.model_dump() for message in messages]
     assert (record.stale_action, record.final_reply, record.main_vetoed) == (
@@ -144,6 +166,42 @@ async def test_reply_echo_updates_history_store_and_audit(make_case) -> None:
         False,
     )
     assert record.latency_ms >= 0
+
+
+@pytest.mark.parametrize("mention", [False, True])
+async def test_veto_leaves_no_group_notice_outside_debug_groups(make_case, mention: bool) -> None:
+    profile = _profile()
+    profile.trigger_mode = None
+    profile.nickname = "asuka"
+    profile.allowed_groups = [_GROUP, _GROUP + 1]
+    profile.debug_groups = [_GROUP]
+    case = make_case([profile])
+    case.llm.chat_completion.return_value = _result("<|act:silent|>")
+
+    await case.manager.handle_group_event(
+        _event("10", text="AsUkA，你觉得呢？", mention=mention, group_id=_GROUP + 1)
+    )
+    assert (await case.next_audit()).main_vetoed
+    case.sender.send_group_msg.assert_not_called()
+    _, messages = case.llm.chat_completion.await_args.args
+    assert "仅输出 <|act:silent|>" in messages[0].content
+
+
+async def test_model_error_is_reported_even_when_group_debug_is_off(make_case) -> None:
+    profile = _profile()
+    profile.trigger_mode = None
+    profile.nickname = "asuka"
+    case = make_case([profile])
+    case.llm.chat_completion.side_effect = LLMRequestError("private upstream diagnostic", 429)
+
+    await case.manager.handle_group_event(_event("10", text="AsUkA，在吗？"))
+
+    report = await asyncio.wait_for(case.sends.get(), timeout=2)
+    assert report == (1, _GROUP, "【Kairos 错误】模型接口返回 HTTP 429。", "10")
+    case.sender.send_group_msg.assert_awaited_once()
+    assert [message.msg_id for message in case.manager.runtimes[1].sessions[_GROUP].buffer] == [
+        "10"
+    ]
 
 
 async def test_concurrent_first_events_warm_up_once_and_resume_aliases(make_case) -> None:
@@ -255,19 +313,16 @@ async def test_postprocess_stops_send_and_saves_audit(
 
 @pytest.mark.parametrize(("delta", "action"), [(3, "SEND_WITH_REPLY"), (6, "DROP_STALE")])
 async def test_ingress_during_inference_drives_stale_decision(
-    make_case, delta: int, action: str, monkeypatch: pytest.MonkeyPatch
+    make_case, delta: int, action: str
 ) -> None:
     profile = _profile()
     profile.trigger_mode = "mention_only"
     case = make_case([profile])
     inference_started = asyncio.Event()
     release_inference = asyncio.Event()
-    continuation = "我还有个想法。"
-    generated = f"{_REPLY} || {continuation}"
-    typing_delay = Mock(return_value=0)
-    monkeypatch.setattr(bot_instance, "compute_typing_delay", typing_delay)
+    generated = f"{_REPLY}\n\n我还有个想法。"
 
-    async def reply(*_args) -> LLMResult:
+    async def reply(*_args, **_kwargs) -> LLMResult:
         inference_started.set()
         await release_inference.wait()
         return _result(generated)
@@ -290,17 +345,13 @@ async def test_ingress_during_inference_drives_stale_decision(
 
     assert record.stale_action == action
     if delta == 3:
-        assert case.sender.send_group_msg.await_args_list == [
-            call(1, _GROUP, _REPLY, reply_to_msg_id="last-part"),
-            call(1, _GROUP, continuation, reply_to_msg_id=None),
-        ]
-        typing_delay.assert_called_once_with(continuation)
+        case.sender.send_group_msg.assert_awaited_once_with(
+            1, _GROUP, generated, reply_to_msg_id="last-part"
+        )
         assert record.final_reply == generated
-        assert session.buffer[-2].reply_to_msg_id == "last-part"
-        assert session.buffer[-1].reply_to_msg_id is None
+        assert session.buffer[-1].reply_to_msg_id == "last-part"
     else:
         case.sender.send_group_msg.assert_not_called()
-        typing_delay.assert_not_called()
         assert record.final_reply is None
     assert [call.args[0].msg_id for call in case.store.save_message.await_args_list][:2] == [
         "first-part",
@@ -315,7 +366,7 @@ async def test_follow_up_gates_on_latest_inbound_message_after_bot_sends(make_ca
     inference_started = asyncio.Event()
     release_inference = asyncio.Event()
 
-    async def reply(*_args) -> LLMResult:
+    async def reply(*_args, **_kwargs) -> LLMResult:
         if case.llm.chat_completion.await_count == 1:
             inference_started.set()
             await release_inference.wait()
@@ -385,7 +436,7 @@ async def test_main_cleans_up_in_order_after_signal_or_start_failure(
         order.append("llm.create")
         return Mock(aclose=operation("llm.close"))
 
-    def manager(*_args) -> Mock:
+    def manager(*_args, **_kwargs) -> Mock:
         order.append("manager.create")
         return Mock(runtimes={1: Mock()}, shutdown=operation("manager.shutdown"))
 

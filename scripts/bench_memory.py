@@ -150,6 +150,7 @@ async def _exercise() -> Benchmark:
             nickname=f"机器人{bot}",
             persona_prompt="我是群友，说话简短。",
             chat_model_key="mock",
+            trigger_mode="all_with_veto",
             debounce=DebounceConfig(normal_seconds=0, max_wait_seconds=0, mention_seconds=0),
             rate_limit=RateLimitConfig(cooldown_seconds=0),
         )

@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from time import monotonic
+from uuid import uuid4
 
 import structlog
 
@@ -16,14 +17,14 @@ from kairos.protocols import GateHook
 
 _log = structlog.get_logger(__name__)
 
-type TriggerCallback = Callable[[], Awaitable[None]]
+type TriggerCallback = Callable[[NormalizedMessage], Awaitable[None]]
 
 
 @dataclass(slots=True)
 class _PendingTrigger:
     first_at: float
     deadline: float
-    urgent: bool
+    message: NormalizedMessage
     callback: TriggerCallback
 
 
@@ -35,6 +36,7 @@ class GroupSession:
     ) -> None:
         self.profile = profile
         self.group_id = group_id
+        self.llm_session_id = f"ses_{uuid4().hex}"
         self.gate_hook = gate_hook
         self.buffer: deque[NormalizedMessage] = deque(maxlen=profile.ring_buffer_size)
         self.seq = 0
@@ -43,7 +45,9 @@ class GroupSession:
         self.pipeline_lock = Lock()
         self.last_bot_reply_at: float | None = None
         self.consecutive_peer_bot_turns = 0
-        self._normalizer = MessageNormalizer(profile.bot_id, profile.self_id, self.alias_table)
+        self._normalizer = MessageNormalizer(
+            profile.bot_id, profile.self_id, self.alias_table, bot_name=profile.nickname
+        )
         self._pending: _PendingTrigger | None = None
         self._timer: TimerHandle | None = None
         self._trigger_task: Task[None] | None = None
@@ -52,7 +56,11 @@ class GroupSession:
     def warmup(self, history: Sequence[NormalizedMessage]) -> None:
         """Rebuild a fresh session from persisted individual arrivals in time order."""
         for message in history:
-            if message.bot_id != self.profile.bot_id or message.group_id != self.group_id:
+            if (
+                message.bot_id != self.profile.bot_id
+                or message.group_id != self.group_id
+                or message.is_kairos_notice
+            ):
                 continue
             if not message.is_bot:
                 self.alias_table.restore_alias(message.sender_qq, message.sender_alias)
@@ -66,7 +74,7 @@ class GroupSession:
             return None, False
 
         message = self._normalizer.normalize(event, self.bot_msg_ids, hosted_bot_ids)
-        if message is None:
+        if message is None or message.is_kairos_notice:
             return None, False
         if not message.is_bot and not message.is_peer_bot:
             self.consecutive_peer_bot_turns = 0
@@ -102,7 +110,7 @@ class GroupSession:
     def evaluate_l1a_gate(self, latest_msg: NormalizedMessage, now_mono: float) -> tuple[bool, str]:
         """Apply group-level rules and count a peer turn on admission."""
         rate = self.profile.rate_limit
-        addressed = latest_msg.is_at_bot or latest_msg.is_reply_to_bot
+        addressed = latest_msg.addresses_bot
         if latest_msg.is_peer_bot and self.consecutive_peer_bot_turns >= rate.peer_bot_max_turns:
             return False, "peer_bot_limit"
         if (
@@ -111,13 +119,19 @@ class GroupSession:
             and now_mono - self.last_bot_reply_at < rate.cooldown_seconds
         ):
             return False, "cooldown"
-        if not addressed and self.profile.trigger_mode == "mention_only":
-            return False, "mention_only"
+        if not addressed and self.profile.trigger_mode != "all_with_veto":
+            return False, self.profile.trigger_mode or "not_addressed"
         if latest_msg.is_peer_bot:
             self.consecutive_peer_bot_turns += 1
         return True, "pass"
 
-    def schedule_trigger(self, msg: NormalizedMessage, callback: TriggerCallback) -> None:
+    def schedule_trigger(
+        self,
+        msg: NormalizedMessage,
+        callback: TriggerCallback,
+        *,
+        buffered: NormalizedMessage | None = None,
+    ) -> None:
         """Coalesce waiting work and preserve the earliest addressed-message deadline."""
         if self._closed:
             return
@@ -127,15 +141,19 @@ class GroupSession:
         pending = self._pending
         first_at = pending.first_at if pending is not None else now
         deadline = min(now + debounce.normal_seconds, first_at + debounce.max_wait_seconds)
-        urgent = msg.is_at_bot or msg.is_reply_to_bot
-        if urgent:
+        addressed = msg.addresses_bot
+        message = (buffered or msg) if addressed else msg
+        if addressed:
             deadline = min(deadline, now + debounce.mention_seconds)
         if pending is not None:
-            urgent = urgent or pending.urgent
-            if urgent or pending.deadline <= now:
+            if addressed or pending.message.addresses_bot or pending.deadline <= now:
                 deadline = min(deadline, pending.deadline)
+            if pending.message.addresses_bot and not addressed:
+                message = pending.message
+                if buffered is not None and buffered.msg_id == message.msg_id:
+                    message = buffered
 
-        self._pending = _PendingTrigger(first_at, deadline, urgent, callback)
+        self._pending = _PendingTrigger(first_at, deadline, message, callback)
         self._arm_timer()
 
     def close(self) -> None:
@@ -179,12 +197,12 @@ class GroupSession:
         if pending is None:
             return
         self._pending = None
-        task = create_task(self._run_trigger(pending.callback))
+        task = create_task(self._run_trigger(pending))
         self._trigger_task = task
         task.add_done_callback(self._trigger_done)
 
-    async def _run_trigger(self, callback: TriggerCallback) -> None:
-        await callback()
+    async def _run_trigger(self, pending: _PendingTrigger) -> None:
+        await pending.callback(pending.message)
 
     def _trigger_done(self, task: Task[None]) -> None:
         self._trigger_task = None

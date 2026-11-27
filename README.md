@@ -1,20 +1,23 @@
 # Kairos（知时）
 
-Kairos 在一个 Python 进程内托管 1–3 个 QQ Bot，通过 OneBot v11 反向 WebSocket 接收群消息。它使用 PostgreSQL 保存群消息和决策审计，并通过 OpenAI 兼容接口生成回复。消息聚合、角色分离、防抖和过期检查的设计见 [Stage 1 实现规划](Kairos_设计文档/02_Kairos_Stage1_技术栈与2C4G工程实现规划.md)。
+Kairos 在一个 Python 进程内托管 1–3 个 QQ Bot，通过 OneBot v11 反向 WebSocket 接收群消息。它使用 PostgreSQL 保存群消息和决策审计，并按每个 Bot 的模型配置生成回复。 [当前进度与交接](docs/HANDOFF.md) · [Stage 1 实现规划](docs/Kairos_设计文档/02_Kairos_Stage1_技术栈与2C4G工程实现规划.md)
 
 ## 在 WSL2 本地运行
 
-在 WSL2 的 Linux 文件系统中检出仓库，例如 `~/Lab/Kairos`。**请勿放在 `/mnt/c` 等 Windows 挂载目录下。** 准备 Python 3.12 或更高版本、`uv` 和原生 PostgreSQL 16 或更高版本。首次启动时，在仓库根目录准备环境和配置副本。
+在 WSL2 的 Linux 文件系统中检出仓库，例如 `~/Lab/Kairos`。**请勿放在 `/mnt/c` 等 Windows 挂载目录下。** 准备 Python 3.12 或更高版本、`uv`、原生 PostgreSQL 16 或更高版本、`xvfb` 和 `xauth`。首次启动时，在仓库根目录准备环境和配置副本。
 
 ```sh
 uv sync --dev
-cp config/global.example.yaml config/global.yaml
-cp config/bots/example_companion.yaml config/bots/lin_xiaoman.yaml
+test -e .env || cp .env.sample .env
+chmod 600 .env
+test -e config/global.yaml || cp config/global.example.yaml config/global.yaml
+mkdir -p config/bots
+test -e config/bots/1.yaml || cp config/examples/bots/1.yaml config/bots/1.yaml
 ```
 
 ### PostgreSQL
 
-在专用开发集群中创建应用用户和数据库。第一条命令会提示设置数据库密码。
+用 `pg_lsclusters` 查看 WSL 中的原生集群，用 `pg_isready -h /var/run/postgresql` 检查 Unix socket。首次初始化开发数据库时，用原生 PostgreSQL 的管理账号创建应用用户和数据库。第一条命令会提示设置数据库密码。
 
 ```sh
 sudo -u postgres createuser --login --pwprompt kairos
@@ -25,55 +28,79 @@ sudo -u postgres createdb --owner=kairos kairos
 
 ### 配置和启动
 
-在仓库根目录的 `.env` 中设置以下变量。将示例值替换为本地值，数据库密码中的 URL 保留字符需要编码。使用 `chmod 600 .env` 限制凭据文件的读取权限。
+用 [.env.sample](.env.sample) 设置本地 `.env`，填写 PostgreSQL 连接串、NapCat 反向 WebSocket 令牌、模型 API 密钥和要启用的 Bot ID。数据库密码中的 URL 保留字符需要编码。`.env` 由 Git 忽略。
 
-```dotenv
-KAIROS_PG_DSN='postgresql://kairos:replace-with-url-encoded-password@127.0.0.1:5432/kairos'
-KAIROS_ONEBOT_ACCESS_TOKEN='replace-with-onebot-token'
-OPENAI_API_KEY='replace-with-provider-key'
-KAIROS_BOT_SELF_ID=90000001
-KAIROS_SECOND_BOT_SELF_ID=90000002
-```
-
-`config/global.yaml` 的 `llm_models` 支持多个命名槽位。每个 Bot 的 `chat_model_key` 选择其中一个槽位。下列两个 YAML 文件各配置一个 Bot。
+`config/bots` 中每个 Bot 的文件名为数字，`1.yaml` 对应 Bot ID `1`。在 `.env` 中设置 `KAIROS_ENABLED_BOTS=1,2` 即可启用以下两份配置。QQ 号、显示名、群白名单和回复模型 `llm.chat` 都写在各自的 YAML 里。两个 Bot 可以引用不同的 `.env` 密钥。
 
 ```yaml
-# config/bots/lin_xiaoman.yaml
-bot_id: lin_xiaoman
-self_id: "${KAIROS_BOT_SELF_ID}"
+# config/bots/1.yaml
+self_id: 10000000000000001
 nickname: 林小满
 persona_prompt: 我是林小满，喜欢聊做饭和游戏。
-chat_model_key: chat_model
-trigger_mode: mention_only
-allowed_groups: [900001]
+llm:
+  chat:
+    provider: google_ai_studio
+    api_format: gemini_generate_content
+    model: gemini-3.5-flash-lite
+    api_key: "${GEMINI_API_KEY}"
+    thinking_level: minimal
+allowed_groups:
+  - 123456789
+  - 234567890
+debug_groups:
+  - 123456789
 ```
 
 ```yaml
-# config/bots/chen_adai.yaml
-bot_id: chen_adai
-self_id: "${KAIROS_SECOND_BOT_SELF_ID}"
+# config/bots/2.yaml
+self_id: 10000000000000002
 nickname: 陈阿呆
 persona_prompt: 我是陈阿呆，喜欢聊电脑和电影。
-chat_model_key: chat_model
-trigger_mode: mention_only
-allowed_groups: [900001]
+llm:
+  chat:
+    provider: openai
+    api_format: openai_responses
+    model: gpt-4o-mini
+    api_key: "${BOT_2_OPENAI_API_KEY}"
+allowed_groups:
+  - 345678901
+  - 456789012
 ```
 
-将示例 QQ 号和群号换成本次测试账号及隔离测试群。每个 Bot 必须有不同的 `bot_id` 和 `self_id`。`example_*.yaml` 是配置模板。首次联调使用 `mention_only` 和非空群白名单。
+把示例 `self_id` 换成 NapCat 登录的实际 QQ 号，每个启用的 Bot 使用不同的 QQ 号。实际群号填入该 Bot 的 `allowed_groups`，每群一项。空列表表示允许所有群，首次联调请填写测试群。更改启用名单或 YAML 后重启 Kairos。
+
+`provider` 选择默认地址和认证方式，`api_format` 选择请求和响应格式。OpenCode Go 可按同一个 API Key 选择不同格式，`model` 填 Go API 的模型 ID。各预设的 YAML 写法见 [Bot 配置示例](config/examples/bots/1.yaml)。
+
+每个模型可配置 `max_tokens`、`max_concurrency`、`max_retries`、`timeout_connect` 和 `timeout_read`。兼容代理的 `base_url` 写到 API 版本，例如 `https://your-provider.example/v1`。已有 `chat_model_key` 与全局 `llm_models` 的配置可继续加载。迁移时，把对应模型移到该 Bot 的 `llm.chat`，移除该 Bot 的 `chat_model_key`，并在所有 Bot 迁移后移除全局模型表。
 
 ```sh
-set -a
-. ./.env
-set +a
-uv run alembic upgrade head
-uv run python -m kairos.main --config config/global.yaml --bots-dir config/bots
+make dev
 ```
 
-迁移创建 `group_messages` 和 `decision_audit_logs`。进程出现 `kairos_ready` 日志后，反向 WebSocket 开始接收连接。
+`make dev` 从 `.env` 和 `config/global.yaml` 读取配置，连接已运行的原生 PostgreSQL，执行 `alembic upgrade head` 并启动 Kairos。迁移创建 `group_messages` 和 `decision_audit_logs`。OneBot 端口就绪后，`make dev` 复用已运行的 NapCat，或用 Xvfb 启动 `~/Napcat/opt/QQ/qq`。安装路径不同可用 `NAPCAT_QQ=/path/to/qq make dev`。按 Ctrl+C 会停止这次由 `make dev` 启动的进程。
+
+使用 `make launcher` 打开 WSLg 桌面启动管理器。窗口可分别启动或停止两个服务，并显示运行日志。关闭窗口会停止由它启动的进程。桌面入口使用系统 Python、`python3-gi` 和 `gir1.2-gtk-3.0`。终端里可用 `make kairos` 或 `make napcat` 单独启动服务。
+
+### 独立后台运行 NapCat
+
+启用 systemd 的 WSL 可以用 `make napcat-start` 启动独立的用户服务。NapCat 读取自身安装目录的配置，在后台等待 QQ 登录。已有前台 NapCat 时，先正常退出该实例，再执行后台启动命令。安装路径不同可用 `NAPCAT_QQ=/path/to/qq make napcat-start`。
+
+```sh
+make napcat-start
+journalctl --user -u kairos-napcat.service -f
+```
+
+启动后在 NapCat WebUI 登录 QQ，默认地址是 [http://127.0.0.1:6099/webui/](http://127.0.0.1:6099/webui/)。登录后可以用 `make kairos` 启动 Kairos。NapCat 若退出，先查看日志，再手动执行 `make napcat-start`。
+
+按 Ctrl+C 退出日志查看。用 `make napcat-stop` 停止后台 NapCat。若需要退出所有登录会话，可用 `loginctl enable-linger "$USER"` 让 systemd 用户管理器继续运行。WSL 实例关闭时后台服务会一起停止。 [systemd 用户会话文档](https://www.freedesktop.org/software/systemd/man/latest/loginctl.html) · [WSL systemd 文档](https://devblogs.microsoft.com/commandline/systemd-support-is-now-available-in-wsl/)
 
 ### NapCat 反向 WebSocket
 
-在同一 WSL2 网络环境中，使用 NapCat WebUI 新增一条 WebSocket 客户端。下列字段对应 NapCat 的反向连接配置。[NapCat 接入文档](https://napneko.github.io/use/integration) · [客户端配置字段](https://github.com/NapNeko/NapCatDocs/blob/main/src/config/basic.md)
+Kairos 的反向监听端口写在 `config/global.yaml` 的 `onebot_ws.port`，默认是 `8080`。改端口后重启 Kairos，并更新 NapCat WebSocket 客户端 URL 中的端口。
+
+1. 在安装目录的 `resources/app/app_launcher/napcat/config/webui.json` 核对 WebUI 端口和登录令牌。本机联调可先将该文件的 `host` 设为 `127.0.0.1`。
+2. 先运行 `make napcat`，再打开 NapCat WebUI，默认地址是 [http://127.0.0.1:6099/webui/](http://127.0.0.1:6099/webui/)。也可在 `~/Napcat/opt/QQ` 下运行 `xvfb-run -a ./qq --no-sandbox`。
+3. 由账号操作者在 NapCat 登录测试 QQ，再新增一条 **WebSocket 客户端**。下列字段对应 NapCat 的反向连接配置。 [NapCat 接入文档](https://napcat.napneko.icu/use/integration.html) · [客户端配置字段](https://napcat.napneko.icu/config/basic.html)
 
 ```json
 {
@@ -87,7 +114,19 @@ uv run python -m kairos.main --config config/global.yaml --bots-dir config/bots
 }
 ```
 
-令牌使用与 `KAIROS_ONEBOT_ACCESS_TOKEN` 相同的值。真实 QQ 联调时，由账号操作者在 NapCat 完成登录并确认测试群，然后启用这条连接，在白名单测试群内 `@` Bot 验证收发。多个测试账号可连入同一 Kairos 地址。联调结束后停用新增连接，再用 Ctrl+C 停止本地 Kairos 进程。
+这条 WebSocket 连接的令牌取 `KAIROS_ONEBOT_ACCESS_TOKEN` 的值。在对应 Bot YAML 中填好 `self_id` 和 `allowed_groups`，将数字文件名加入 `.env` 的 `KAIROS_ENABLED_BOTS`，再运行 `make kairos`。启用连接后，在白名单群内 `@` Bot 验证收发。多个测试账号可连入同一 Kairos 地址。联调结束后停用新增连接，再按 Ctrl+C 清理本次启动的进程。
+
+每次 NapCat 成功连接 Kairos 后，Bot 按北京时间向 `allowed_groups` 中的第一个群发送「早上好」「中午好」或「晚上好」。群友在白名单群内戳到这个 Bot 时，Bot 会在原群回复 `QAQ`。两种状态消息直接通过 OneBot 发送。
+
+### 聊天触发、上下文与调试
+
+白名单群里的直接 `@`、引用 Bot 聊天回复、或普通文本包含该 Bot 的 `nickname` 都能触发模型。名字匹配忽略大小写。短时间的多个触发会合并处理，群聊插话仍会进入上下文。规则由代码定义，已有的 `trigger_mode` 仅用于兼容旧配置。
+
+每个 Bot 在每个群独立维护默认 40 个上下文消息块。首次收到消息时先从 PostgreSQL 读取本 Bot 在该群的最近 40 条，随后合并同一群友在 10 秒内的相邻连发，并淘汰窗口里最早的块。原始消息逐条保存。请求以人设和最近窗口构建上下文，当前采用按条数淘汰，摘要压缩和输入 token 裁剪留待实现。可在 Bot YAML 中用 `ring_buffer_size` 设置窗口。
+
+模型直接生成聊天正文，整条输出为 `<|act:silent|>` 时表示沉默。通过过期和重复检查后，Kairos 把正文作为一条消息发送并写入聊天历史。Gemini 在普通群和调试群统一使用配置里的 `thinking_level: minimal`。Gemini 和 OpenAI 兼容接口默认使用服务端的输出限制。Anthropic Messages 接口要求填写 `max_tokens`，适配器在未配置时填入 4096。
+
+`debug_groups` 可逐行添加需要联调的白名单群号。模型在调试群选择沉默时，Kairos 引用触发消息发送「这条触发成功但是模型选择沉默」。处理群消息出错时，各白名单群都能收到错误类型和可用的 HTTP 状态码。系统提示与聊天历史分开处理。
 
 ## 测试和内存压测
 
@@ -99,7 +138,7 @@ uv run pytest tests/integration/test_e2e_pipeline.py
 uv run python scripts/bench_memory.py
 ```
 
-端到端回放用本地 WebSocket 模拟 NapCat，用本地 HTTP 模拟 OpenAI 兼容接口。它覆盖同人连发、角色分离、`@` 快路径、过期引用与丢弃、Veto 和双 Bot 防互刷。压测在 3 个 Bot、每个 10 个活跃群上回放 5,000 条消息，检查每群缓冲区有界和 Kairos Core RSS 小于 180 MB。
+端到端回放用本地 WebSocket 模拟 NapCat，用本地 HTTP 模拟模型接口。它覆盖两个 Bot 分别通过 Gemini 和 Chat Completions 使用各自密钥，也覆盖同人连发、角色分离、`@` 快路径、过期处理、Veto 和双 Bot 防互刷。压测在 3 个 Bot、每个 10 个活跃群上回放 5,000 条消息，检查每群缓冲区有界和 Kairos Core RSS 小于 180 MB。
 
 可选 PostgreSQL 用例使用独立测试库。先设置 `KAIROS_TEST_PG_DSN`，再迁移并测试该数据库。
 

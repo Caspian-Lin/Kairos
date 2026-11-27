@@ -12,12 +12,10 @@ def config_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, 
     bots_dir = tmp_path / "bots"
     bots_dir.mkdir()
     copyfile(examples / "global.example.yaml", global_path)
-    example_profile = "example_companion.yaml"
-    copyfile(examples / "bots" / example_profile, bots_dir / example_profile)
-    copyfile(bots_dir / example_profile, bots_dir / "companion.yaml")
+    copyfile(examples / "examples" / "bots" / "1.yaml", bots_dir / "1.yaml")
 
     monkeypatch.setenv("KAIROS_PG_DSN", "postgresql://test:fake@127.0.0.1/kairos_test")
     monkeypatch.setenv("KAIROS_ONEBOT_ACCESS_TOKEN", "test-ws-token")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-llm-key")
-    monkeypatch.setenv("KAIROS_BOT_SELF_ID", "10000000000000001")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("KAIROS_ENABLED_BOTS", "1")
     return global_path, bots_dir

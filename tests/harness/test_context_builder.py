@@ -62,8 +62,9 @@ def test_group_history_keeps_group_and_assistant_turns_separate(profile: BotProf
     assert [turn.role for turn in turns] == ["system", "user", "assistant", "user"]
     assert profile.persona_prompt in turns[0].content
     assert "U1:阿明、U2:咪咪" in turns[0].content
-    for marker in ("[mID]", "[-Xs]", "[U1:昵称]", "<|act:silent|>", "第一人称", "||"):
+    for marker in ("[mID]", "[-Xs]", "[U1:昵称]", "<|act:silent|>", "第一人称"):
         assert marker in turns[0].content
+    assert "<|reason|>" not in turns[0].content
     assert turns[1].content == "[m1] [-13s] [U1:阿明]: 晚上吃啥\n[m2] [-10s] [U2:咪咪]: 还没定"
     assert turns[2].content == "我想吃粉"
     assert turns[3].content == "[m4] [-2s] [U1:阿明] (回复 m3): 那就米粉"
@@ -177,55 +178,43 @@ def test_naive_utc_and_aware_times_share_timeline(profile: BotProfile) -> None:
 
 @pytest.mark.parametrize(
     "raw_text",
-    ["   <|act:silent|>\n", "我本来想说 || <|act:silent|> || 还是算了"],
+    ["<|act:silent|>", "   <|act:silent|>\n"],
 )
-def test_veto_marker_suppresses_entire_output(raw_text: str) -> None:
+def test_standalone_veto_marker(raw_text: str) -> None:
     result = process_llm_output(raw_text, [])
 
     assert result.vetoed is True
     assert result.repeated_dropped is False
-    assert result.segments == []
-    assert result.raw_cleaned == raw_text.strip()
+    assert result.content == ""
 
 
-@pytest.mark.parametrize("raw_text", [" \n ", "[m12] [-2s] [我]：", "|| [我] ||"])
-def test_empty_cleaned_output_counts_as_silence(raw_text: str) -> None:
-    result = process_llm_output(raw_text, [])
-
-    assert result.vetoed is True
-    assert result.segments == []
-    assert result.raw_cleaned == ""
+def test_a_mentioned_marker_in_reply_is_ordinary_text() -> None:
+    text = "我看到 <|act:silent|> 这串字符。"
+    result = process_llm_output(text, [])
+    assert not result.vetoed
+    assert result.content == text
 
 
-def test_prefix_cleanup_preserves_text_and_cleans_each_segment() -> None:
-    result = process_llm_output(
-        " [m-12] （-2s） [U7:小满] (回复 m4): 我见过 [m12] || 【我】：[周末约] 行啊 ",
-        [],
-    )
-
-    assert result.vetoed is False
-    assert result.raw_cleaned == "我见过 [m12] || [周末约] 行啊"
-    assert result.segments == ["我见过 [m12]", "[周末约] 行啊"]
+def test_empty_output_is_distinct_from_silence() -> None:
+    result = process_llm_output(" \n ", [])
+    assert not result.vetoed
+    assert result.content == ""
 
 
-def test_extra_segments_fold_into_last_send_and_empty_parts_are_removed() -> None:
-    result = process_llm_output(" || 第一句 || || 第二句 || 第三句 || 第四句 ", [])
-
-    assert result.raw_cleaned == "第一句 || 第二句 || 第三句 || 第四句"
-    assert result.segments == ["第一句", "第二句 第三句 第四句"]
-    assert process_llm_output("一句 || 两句", [], max_segments=1).segments == ["一句 两句"]
+def test_reply_body_preserves_paragraphs_and_literal_delimiters() -> None:
+    text = "[周末约] 我有两个想法。\n\n第一段 || 第二段。"
+    assert process_llm_output(f" \n{text}\n ", []).content == text
 
 
 def test_bigram_repeat_detection_compares_latest_two_replies() -> None:
-    repeated = process_llm_output("[我]: 今天一起吃拉面吧", ["明天约球", "今天一起吃拉面"])
+    repeated = process_llm_output("今天一起吃拉面吧", ["明天约球", "今天一起吃拉面"])
     old_only_match = process_llm_output("今天一起吃拉面吧", ["今天一起吃拉面", "好天气", "几点见"])
 
     assert repeated.vetoed is False
     assert repeated.repeated_dropped is True
-    assert repeated.segments == []
-    assert repeated.raw_cleaned == "今天一起吃拉面吧"
+    assert repeated.content == ""
     assert old_only_match.repeated_dropped is False
-    assert old_only_match.segments == ["今天一起吃拉面吧"]
+    assert old_only_match.content == "今天一起吃拉面吧"
 
 
 def test_jaccard_threshold_is_strict_and_short_replies_compare_characters() -> None:
@@ -234,6 +223,6 @@ def test_jaccard_threshold_is_strict_and_short_replies_compare_characters() -> N
     different_ack = process_llm_output("好", ["嗯"])
 
     assert exact_threshold.repeated_dropped is False
-    assert exact_threshold.segments == ["abcdefgh"]
+    assert exact_threshold.content == "abcdefgh"
     assert repeated_ack.repeated_dropped is True
-    assert different_ack.segments == ["好"]
+    assert different_ack.content == "好"

@@ -40,6 +40,8 @@ class OneBotWSGateway:
     ) -> None:
         self.config = config
         self.on_group_event = on_group_event
+        self.on_bot_online: Callable[[int], Awaitable[None]] | None = None
+        self.on_group_poke: Callable[[int, int], Awaitable[None]] | None = None
         self.pending_echoes: dict[str, _PendingEcho] = {}
         self._connections: dict[int, web.WebSocketResponse] = {}
         self._sockets: set[web.WebSocketResponse] = set()
@@ -129,6 +131,8 @@ class OneBotWSGateway:
         if old_socket is not None:
             self._fail_pending(self_id, old_socket)
             self._track(_close_socket(old_socket))
+        if (callback := self.on_bot_online) is not None:
+            self._track(self._dispatch_status(self_id, socket, lambda: callback(self_id)))
 
     def _unregister(self, self_id: int, socket: web.WebSocketResponse) -> None:
         if self._connections.get(self_id) is socket:
@@ -201,6 +205,13 @@ class OneBotWSGateway:
             if pending.socket is socket and not pending.future.done():
                 pending.future.set_result(payload)
             return
+        if (callback_poke := self.on_group_poke) is not None:
+            group_id = _group_poke_target(self_id, payload)
+            if group_id is not None:
+                self._track(
+                    self._dispatch_status(self_id, socket, lambda: callback_poke(self_id, group_id))
+                )
+                return
         if payload.get("post_type") != "message" or payload.get("message_type") != "group":
             _log.debug("onebot_event_ignored", self_id=self_id)
             return
@@ -224,6 +235,21 @@ class OneBotWSGateway:
                 self_id=event.self_id,
                 group_id=event.group_id,
                 error_type=type(exc).__name__,
+            )
+
+    async def _dispatch_status(
+        self,
+        self_id: int,
+        socket: web.WebSocketResponse,
+        callback: Callable[[], Awaitable[None]],
+    ) -> None:
+        if self._connections.get(self_id) is not socket or socket.closed:
+            return
+        try:
+            await callback()
+        except Exception as exc:  # noqa: BLE001 - Keep status actions off the socket reader.
+            _log.warning(
+                "onebot_status_callback_failed", self_id=self_id, error_type=type(exc).__name__
             )
 
     async def send_group_msg(
@@ -306,6 +332,26 @@ def _message_id(value: Any) -> str:
     if type(value) is int or (isinstance(value, str) and value):
         return str(value)
     raise ValueError("Expected a message ID")
+
+
+def _group_poke_target(self_id: int, payload: dict[str, Any]) -> int | None:
+    if (
+        payload.get("post_type") != "notice"
+        or payload.get("notice_type") != "notify"
+        or payload.get("sub_type") != "poke"
+        or "group_id" not in payload
+    ):
+        return None
+    try:
+        group_id = _integer(payload["group_id"])
+        target = _integer(payload["target_id"])
+        sender = _integer(payload["user_id"])
+    except (KeyError, ValueError):
+        _log.warning("onebot_invalid_group_poke", self_id=self_id)
+        return None
+    if group_id > 0 and target == self_id and sender != self_id:
+        return group_id
+    return None
 
 
 def _group_event(self_id: int, payload: dict[str, Any]) -> RawGroupEvent:

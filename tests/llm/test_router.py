@@ -8,7 +8,7 @@ import httpx
 import pytest
 from hpack import Encoder
 
-from kairos.config import LLMModelConfig
+from kairos.config import LLMModelConfig, LLMProvider
 from kairos.llm import LLMConfigError, LLMRequestError, LLMResponseError, LLMRouter, router
 from kairos.models import ChatMessage
 
@@ -100,6 +100,7 @@ async def test_routes_to_models_and_parses_completion(make_router: RouterFactory
         "chat_model",
         _MESSAGES,
         temperature=0.2,
+        max_tokens=600,
         stop=["STOP"],
         response_format={"type": "json_object"},
     )
@@ -118,11 +119,12 @@ async def test_routes_to_models_and_parses_completion(make_router: RouterFactory
         "model": "configured-chat",
         "messages": [message.model_dump() for message in _MESSAGES],
         "temperature": 0.2,
-        "max_tokens": 300,
+        "max_tokens": 600,
         "stop": ["STOP"],
         "response_format": {"type": "json_object"},
     }
     assert json.loads(gate_request.content)["model"] == "fast"
+    assert "max_tokens" not in json.loads(gate_request.content)
     assert result.content == "接住了"
     assert result.model == "resolved-chat"
     assert result.latency_ms >= 0
@@ -130,6 +132,184 @@ async def test_routes_to_models_and_parses_completion(make_router: RouterFactory
     assert gate_result.model == "fast"
     assert gate_result.prompt_tokens is None
     assert gate_result.completion_tokens is None
+
+
+async def test_openai_presets_encode_chat_completions_and_responses(
+    make_router: RouterFactory,
+) -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == f"Bearer {_API_KEY}"
+        payload = json.loads(request.content)
+        if request.url.path == "/v1/chat/completions":
+            assert payload["messages"] == [message.model_dump() for message in _MESSAGES]
+            assert "max_completion_tokens" not in payload
+            assert "temperature" not in payload
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "在呢", "reasoning_content": "聊天思考"}}]
+                },
+            )
+
+        assert str(request.url) == "https://api.openai.com/v1/responses"
+        assert payload["input"] == [message.model_dump() for message in _MESSAGES]
+        assert "max_output_tokens" not in payload
+        assert payload["store"] is False
+        assert "reasoning" not in payload
+        return httpx.Response(
+            200,
+            json={
+                "model": "resolved-response",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "公开摘要"}],
+                        "encrypted_content": "opaque-data",
+                    },
+                    {"type": "message", "content": [{"type": "output_text", "text": "在呢"}]},
+                ],
+                "usage": {"input_tokens": 8, "output_tokens": 4},
+            },
+        )
+
+    chat = LLMModelConfig(provider="openai", api_key=_API_KEY, model="gpt-4o-mini")
+    responses = LLMModelConfig(
+        provider="openai",
+        api_format="openai_responses",
+        api_key=_API_KEY,
+        model="reasoning-model",
+    )
+    client = make_router(handle, {"chat": chat, "responses": responses})
+    assert (await client.chat_completion("chat", _MESSAGES)).content == "在呢"
+    result = await client.chat_completion("responses", _MESSAGES)
+    assert result.content == "在呢"
+    assert result.model == "resolved-response"
+    assert (result.prompt_tokens, result.completion_tokens) == (8, 4)
+
+
+@pytest.mark.parametrize(
+    ("provider", "url", "auth_header", "auth_value"),
+    [
+        ("anthropic", "https://api.anthropic.com/v1/messages", "x-api-key", _API_KEY),
+        (
+            "opencode_go",
+            "https://opencode.ai/inference/go/anthropic/v1/messages",
+            "authorization",
+            f"Bearer {_API_KEY}",
+        ),
+    ],
+)
+async def test_messages_presets(
+    make_router: RouterFactory, provider: LLMProvider, url: str, auth_header: str, auth_value: str
+) -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == url
+        assert request.headers[auth_header] == auth_value
+        if provider == "anthropic":
+            assert request.headers["anthropic-version"]
+        else:
+            assert request.headers["x-opencode-session"].startswith("ses_")
+            assert request.headers["user-agent"] == "Kairos"
+        assert json.loads(request.content) == {
+            "model": "configured-model",
+            "system": "简短回复",
+            "messages": [{"role": "user", "content": "你好"}],
+            "max_tokens": 4096,
+            "stop_sequences": ["END"],
+        }
+        return httpx.Response(
+            200,
+            json={
+                "content": [
+                    {"type": "thinking", "thinking": "公开思考", "signature": "opaque-signature"},
+                    {"type": "redacted_thinking", "data": "opaque-data"},
+                    {"type": "text", "text": "在"},
+                    {"type": "text", "text": "呢"},
+                ],
+                "usage": {"input_tokens": 7, "output_tokens": 3},
+            },
+        )
+
+    model = LLMModelConfig(
+        provider=provider,
+        api_format="anthropic_messages",
+        api_key=_API_KEY,
+        model="configured-model",
+    )
+    result = await make_router(handle, {"chat": model}).chat_completion(
+        "chat", _MESSAGES, stop="END"
+    )
+    assert result.content == "在呢"
+    assert result.model == "configured-model"
+    assert (result.prompt_tokens, result.completion_tokens) == (7, 3)
+
+
+async def test_go_uses_conversation_id_only_for_its_own_requests(
+    make_router: RouterFactory,
+) -> None:
+    sessions: list[str | None] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sessions.append(request.headers.get("x-opencode-session"))
+        if request.url.host == "opencode.ai":
+            assert request.url.path == "/inference/go/openai/v1/chat/completions"
+            assert request.headers["authorization"] == f"Bearer {_API_KEY}"
+        return _completion()
+
+    go = LLMModelConfig(provider="opencode_go", api_key=_API_KEY, model="kimi-k3")
+    client = make_router(handle, {"go": go, "legacy": _CHAT})
+    for group in ("ses_group_a", "ses_group_a", "ses_group_b"):
+        await client.chat_completion("go", _MESSAGES, session_id=group)
+    await client.chat_completion("legacy", _MESSAGES, session_id="ses_group_a")
+    assert sessions == ["ses_group_a", "ses_group_a", "ses_group_b", None]
+
+
+async def test_gemini_preset_maps_history_and_excludes_thought_parts(
+    make_router: RouterFactory,
+) -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == (
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent"
+        )
+        assert request.headers["x-goog-api-key"] == _API_KEY
+        payload = json.loads(request.content)
+        assert payload["systemInstruction"] == {"parts": [{"text": "简短回复"}]}
+        assert [turn["role"] for turn in payload["contents"]] == ["user", "model", "user"]
+        assert payload["generationConfig"] == {
+            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
+        }
+        return httpx.Response(
+            200,
+            json={
+                "modelVersion": "gemini-3.5-flash-lite",
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "thought": True,
+                                    "text": "公开思考",
+                                    "thoughtSignature": "opaque-data",
+                                },
+                                {"text": "在呢"},
+                            ]
+                        }
+                    }
+                ],
+                "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 2},
+            },
+        )
+
+    model = LLMModelConfig(
+        provider="google_ai_studio",
+        api_key=_API_KEY,
+        model="gemini-3.5-flash-lite",
+        thinking_level="minimal",
+    )
+    history = [*_MESSAGES, ChatMessage(role="assistant", content="早")]
+    result = await make_router(handle, {"chat": model}).chat_completion("chat", history)
+    assert result.content == "在呢"
+    assert (result.prompt_tokens, result.completion_tokens) == (9, 2)
 
 
 async def test_retries_rate_limit_and_service_unavailable(

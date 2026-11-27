@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from kairos.config import BotProfile
+from kairos.harness.postprocess import SILENT_ACTION
 from kairos.models import ChatMessage, NormalizedMessage
 
 
@@ -42,13 +43,13 @@ class ContextBuilder:
         roster_text = "、".join(roster) or "暂无"
         prompt = (
             f"{profile.persona_prompt}\n\n"
+            f"我的群聊名是 {profile.nickname}。"
             "我正在群聊中。user 是群友的发言，assistant 是我此前发出的消息。"
             "[mID] 是消息 ID，[-Xs] 等标记表示距现在的时间，"
             "[U1:昵称] 标注发言人，(回复 mID) 指向被引用的消息。\n"
             f"当前活跃群友：{roster_text}\n"
-            "如果现在不适合插话或接不上梗，仅输出 <|act:silent|>。\n"
-            "回复时直接用第一人称写口语正文，开头不带 [mID]、[-Xs]、[我] 等标签。"
-            "需要连续发两句短话时用 || 分隔，最多两段。"
+            f"如果决定沉默，仅输出 {SILENT_ACTION}。\n"
+            "回复时直接用第一人称写要发到群里的正文。按话题决定篇幅，开头省略 [mID]、[-Xs]、[我] 等标签。"
         )
         turns = [ChatMessage(role="system", content=prompt)]
         previous_activity: datetime | None = None

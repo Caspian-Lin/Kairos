@@ -6,7 +6,7 @@ import logging
 import os
 import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 
 import structlog
@@ -37,6 +37,8 @@ class MultiBotManager:
         llm_client: LLMClient,
         sender: OneBotSender,
         audit_logger: AuditLogger,
+        *,
+        bot_llm_clients: Mapping[str, LLMClient] | None = None,
     ) -> None:
         if not 1 <= len(profiles) <= 3:
             raise ValueError("Kairos requires between 1 and 3 active bot profiles.")
@@ -45,9 +47,15 @@ class MultiBotManager:
             profiles
         ):
             raise ValueError("Active bot profiles must have distinct self_id and bot_id values.")
+        bot_llm_clients = bot_llm_clients or {}
         self.runtimes = {
             profile.self_id: BotRuntime(
-                profile, hosted_bot_ids, store, llm_client, sender, audit_logger
+                profile,
+                hosted_bot_ids,
+                store,
+                bot_llm_clients.get(profile.bot_id, llm_client),
+                sender,
+                audit_logger,
             )
             for profile in profiles
         }
@@ -55,6 +63,14 @@ class MultiBotManager:
     async def handle_group_event(self, event: RawGroupEvent) -> None:
         if (runtime := self.runtimes.get(event.self_id)) is not None:
             await runtime.handle_group_event(event)
+
+    async def handle_bot_online(self, self_id: int) -> None:
+        if (runtime := self.runtimes.get(self_id)) is not None:
+            await runtime.handle_online()
+
+    async def handle_group_poke(self, self_id: int, group_id: int) -> None:
+        if (runtime := self.runtimes.get(self_id)) is not None:
+            await runtime.handle_group_poke(group_id)
 
     async def shutdown(self) -> None:
         await asyncio.gather(*(runtime.shutdown() for runtime in self.runtimes.values()))
@@ -76,13 +92,22 @@ async def run(config: GlobalConfig, profiles: Sequence[BotProfile]) -> None:
 
         llm_client = LLMRouter(config.llm_models)
         resources.push_async_callback(llm_client.aclose)
+        bot_llm_clients = {
+            profile.bot_id: llm_client.for_models(profile.llm)
+            for profile in profiles
+            if profile.llm
+        }
         audit_logger = AuditLogger(store)
         resources.push_async_callback(audit_logger.drain)
 
         gateway = OneBotWSGateway(config.onebot_ws)
-        manager = MultiBotManager(profiles, store, llm_client, gateway, audit_logger)
+        manager = MultiBotManager(
+            profiles, store, llm_client, gateway, audit_logger, bot_llm_clients=bot_llm_clients
+        )
         resources.push_async_callback(manager.shutdown)
         gateway.on_group_event = manager.handle_group_event
+        gateway.on_bot_online = manager.handle_bot_online
+        gateway.on_group_poke = manager.handle_group_poke
         resources.push_async_callback(gateway.stop)
         await gateway.start()
 

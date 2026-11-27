@@ -5,4 +5,3 @@ __pycache__/
 .env
 config/global.yaml
 config/bots/*.yaml
-!config/bots/example_*.yaml

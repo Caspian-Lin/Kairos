@@ -139,10 +139,13 @@ def _as_message_id(value: object) -> str | None:
 class MessageNormalizer:
     """Normalize events for one bot in one group."""
 
-    def __init__(self, bot_id: str, bot_self_id: int, alias_table: UidAliasTable) -> None:
+    def __init__(
+        self, bot_id: str, bot_self_id: int, alias_table: UidAliasTable, *, bot_name: str = ""
+    ) -> None:
         self._bot_id = bot_id
         self._bot_self_id = bot_self_id
         self._alias_table = alias_table
+        self._bot_name = bot_name.strip().casefold()
 
     def normalize(
         self,
@@ -152,15 +155,19 @@ class MessageNormalizer:
     ) -> NormalizedMessage | None:
         segments = event.segments or _parse_cq_message(event.raw_message)
         parts: list[str] = []
+        plain_text: list[str] = []
         is_at_bot = False
         reply_to_msg_id: str | None = None
 
         for segment in segments:
+            if segment.type != "text":
+                plain_text.append(" ")
             match segment.type:
                 case "text":
                     text = segment.data.get("text")
                     if isinstance(text, str):
                         parts.append(text)
+                        plain_text.append(text)
                 case "at":
                     target = segment.data.get("qq")
                     if target == "all":
@@ -198,6 +205,9 @@ class MessageNormalizer:
             is_bot=is_bot,
             is_at_bot=is_at_bot,
             is_reply_to_bot=reply_to_msg_id is not None and reply_to_msg_id in bot_msg_ids,
+            mentions_bot_name=bool(
+                self._bot_name and self._bot_name in "".join(plain_text).casefold()
+            ),
             is_peer_bot=not is_bot and event.sender_qq in hosted_bot_ids,
             created_at=event.timestamp,
             latest_at=event.timestamp,
@@ -237,5 +247,6 @@ def coalesce_message(
             "latest_at": incoming.latest_at,
             "is_at_bot": last.is_at_bot or incoming.is_at_bot,
             "is_reply_to_bot": last.is_reply_to_bot or incoming.is_reply_to_bot,
+            "mentions_bot_name": last.mentions_bot_name or incoming.mentions_bot_name,
         }
     ), True

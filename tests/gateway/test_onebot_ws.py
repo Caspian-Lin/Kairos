@@ -96,6 +96,19 @@ async def test_two_bots_share_a_port_and_accept_array_and_cq_frames() -> None:
         assert by_bot[102].segments == []
 
 
+async def test_bot_online_callback_runs_after_each_connection_registers() -> None:
+    online: asyncio.Queue[int] = asyncio.Queue()
+    async with _gateway() as (gateway, client, url):
+        gateway.on_bot_online = online.put
+        async with client.ws_connect(url, headers={"X-Self-ID": "101"}) as first:
+            assert await asyncio.wait_for(online.get(), 1) == 101
+            await first.send_json({"self_id": 101, "post_type": "meta_event"})
+        async with client.ws_connect(url) as second:
+            assert online.empty()
+            await second.send_json({"self_id": 101, "post_type": "meta_event"})
+            assert await asyncio.wait_for(online.get(), 1) == 101
+
+
 async def test_first_frame_registration_and_invalid_events_are_isolated() -> None:
     events: asyncio.Queue[RawGroupEvent] = asyncio.Queue()
     failed_callback = asyncio.Event()

@@ -6,6 +6,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+GROUP_SILENCE_NOTICE = "这条触发成功但是模型选择沉默"
+GROUP_ERROR_PREFIX = "【Kairos 错误】"
+
 
 class MessageSegment(BaseModel):
     type: str
@@ -41,9 +44,21 @@ class NormalizedMessage(BaseModel):
     is_bot: bool
     is_at_bot: bool
     is_reply_to_bot: bool
+    mentions_bot_name: bool = False
     is_peer_bot: bool
     created_at: datetime
     latest_at: datetime
+
+    @property
+    def addresses_bot(self) -> bool:
+        return self.is_at_bot or self.is_reply_to_bot or self.mentions_bot_name
+
+    @property
+    def is_kairos_notice(self) -> bool:
+        return (self.is_bot or self.is_peer_bot) and (
+            self.content == GROUP_SILENCE_NOTICE
+            or self.content.startswith(("【Kairos 调试】", GROUP_ERROR_PREFIX))
+        )
 
 
 class ChatMessage(BaseModel):

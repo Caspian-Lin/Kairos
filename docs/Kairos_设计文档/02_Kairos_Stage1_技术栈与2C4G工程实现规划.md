@@ -66,7 +66,7 @@
 * **数据库与持久层（原生 PostgreSQL）**：
   * **PostgreSQL 16+（原生安装）**：相比 SQLite，在多 Bot 并发写入 + 后台慢脑异步更新 + 审计埋点查询下无写锁竞争；原生支持 **`JSONB`**（存上下文快照、话题标签）、**`pg_trgm` / GIN 索引**（免 Embedding 即可实现高质量中文关键词与模糊召回），且后续如需扩展向量或图谱，可直接原地开启扩展，无需迁移数据库。
   * **Python 异步驱动**：`asyncpg`（性能最高、内存极省的 PG 异步驱动，配合轻量 `alembic` 管理表结构演进）。
-* **LLM 路由层**：`httpx`（全异步共享 `AsyncClient` 连接池，复用 HTTP/2 连接降低握手延迟），采用标准 OpenAI 兼容协议，内部配置**三级模型路由**：
+* **LLM 路由层**：各 Bot 在自己的 YAML 里选择模型、服务商、接口格式和密钥引用。`httpx` 共享同一个异步 HTTP/2 连接池，各 Bot 的模型并发限制独立。当前启用 `llm.chat`，后续可扩展门控和后台模型。
   * `gate_model`（极速初筛门控）：优先选与主模型**同家族**的极快小模型（如 `Qwen3-Flash/8B` 配 `Qwen3-Max/30B-A3B`，或 `Gemini Flash-Lite` 配 `Gemini Flash/Pro`），目标耗时 `< 400ms`；
   * `chat_model`（主力群聊）：高情商强网感模型，且拥有**最终沉默否决权（Veto）**；
   * `worker_model`（后台慢脑）：廉价模型，负责异步记忆摘要提炼、话题归纳、推特筛选。
@@ -276,10 +276,10 @@ kairos/
 │   └── postgres_2c4g.conf         # 2C4G PostgreSQL 低内存精调配置片段
 ├── config/
 │   ├── global.yaml                # PostgreSQL DSN、模型路由表、WS 端口
-│   └── bots/                      # 每个 YAML 文件对应一个托管的 Bot 实例
-│       ├── lin_xiaoman.yaml       # Bot 1: 强活人感群友 Profile
-│       ├── chen_adai.yaml         # Bot 2: 强活人感群友 Profile
-│       └── utility_helper.yaml    # Bot 3: 纯工具模式 Profile
+│   └── bots/                      # 数字文件名即 Bot ID，KAIROS_ENABLED_BOTS 选择启用项
+│       ├── 1.yaml                 # Bot 1: 强活人感群友 Profile
+│       ├── 2.yaml                 # Bot 2: 强活人感群友 Profile
+│       └── 3.yaml                 # Bot 3: 纯工具模式 Profile
 └── src/kairos/
     ├── main.py                    # uvloop 入口、加载配置、启动 WS 与调度器
     ├── gateway/
