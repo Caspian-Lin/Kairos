@@ -32,6 +32,33 @@ def test_example_configs_load(config_tree: tuple[Path, Path]) -> None:
     assert profile.rate_limit.peer_bot_max_turns == 2
     assert profile.stale_check.reply_max_delta == 5
     assert profile.ring_buffer_size == 40
+    assert profile.gate_model_key is profile.worker_model_key is None
+    assert profile.gate.model_dump() == {
+        "enabled": False,
+        "persona_card": "",
+        "recent_messages_limit": 12,
+        "timeout_seconds": 1.5,
+        "fail_open": False,
+        "energy_max": 100.0,
+        "energy_recover_per_min": 5.0,
+        "energy_cost_reply": 25.0,
+        "energy_cost_react": 5.0,
+    }
+    assert profile.compaction.model_dump() == {
+        "enabled": False,
+        "input_token_budget": 4096,
+        "trigger_ratio": 0.75,
+        "keep_recent_messages": 16,
+        "summary_max_tokens": 300,
+        "max_persisted_summaries": 3,
+    }
+    assert profile.memory.model_dump() == {
+        "enabled": False,
+        "warm_trigger_messages": 6,
+        "max_notes_recalled": 5,
+        "max_impressions_recalled": 10,
+        "note_extract_interval_messages": 12,
+    }
 
 
 def test_env_expansion_preserves_literal_values(
@@ -90,6 +117,15 @@ def test_legacy_global_model_remains_loadable(config_tree: tuple[Path, Path]) ->
     assert not loaded.llm
     assert model.request_format == "openai_chat_completions"
     assert model.request_temperature == 0.8
+    assert not (loaded.gate.enabled or loaded.compaction.enabled or loaded.memory.enabled)
+
+    profile.update(
+        gate={"enabled": True}, gate_model_key="chat_model", worker_model_key="chat_model"
+    )
+    profile_path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    (loaded,) = load_bot_profiles(bots_dir, config)
+    assert loaded.gate.enabled
+    assert loaded.gate_model_key == loaded.worker_model_key == "chat_model"
 
 
 def test_invalid_bot_ids_name_their_env_variables(
@@ -178,3 +214,66 @@ def test_unknown_chat_model_key(config_tree: tuple[Path, Path]) -> None:
 
     with pytest.raises(ValueError, match="unknown chat_model_key 'unknown_model'"):
         load_bot_profiles(bots_dir, load_global_config(global_path))
+
+
+@pytest.mark.parametrize("field", ("gate_model_key", "worker_model_key"))
+def test_unknown_optional_model_key(config_tree: tuple[Path, Path], field: str) -> None:
+    _, bots_dir = config_tree
+    path = bots_dir / "1.yaml"
+    path.write_text(
+        path.read_text(encoding="utf-8") + f"\n{field}: unknown_model\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match=f"unknown {field} 'unknown_model'"):
+        load_bot_profiles(bots_dir)
+
+
+def test_enabled_gate_requires_local_model(config_tree: tuple[Path, Path]) -> None:
+    _, bots_dir = config_tree
+    path = bots_dir / "1.yaml"
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile["gate"] = {"enabled": True, "persona_card": "爱聊烹饪"}
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"gate\.enabled requires gate_model_key"):
+        load_bot_profiles(bots_dir)
+
+    profile.update(gate_model_key="chat", worker_model_key="chat")
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    (loaded,) = load_bot_profiles(bots_dir)
+    assert loaded.gate.persona_card == "爱聊烹饪"
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    (
+        ("gate", "persona_card", "a" * 201),
+        ("gate", "recent_messages_limit", 0),
+        ("gate", "timeout_seconds", 0),
+        ("gate", "energy_max", 0),
+        ("gate", "energy_recover_per_min", -1),
+        ("gate", "energy_cost_reply", -1),
+        ("gate", "energy_cost_react", -1),
+        ("compaction", "input_token_budget", 511),
+        ("compaction", "trigger_ratio", 0),
+        ("compaction", "trigger_ratio", 1.1),
+        ("compaction", "keep_recent_messages", 0),
+        ("compaction", "summary_max_tokens", 0),
+        ("compaction", "max_persisted_summaries", 0),
+        ("memory", "warm_trigger_messages", 0),
+        ("memory", "max_notes_recalled", -1),
+        ("memory", "max_impressions_recalled", -1),
+        ("memory", "note_extract_interval_messages", 0),
+    ),
+)
+def test_m2_config_rejects_invalid_ranges(
+    config_tree: tuple[Path, Path], section: str, field: str, value: str | float
+) -> None:
+    _, bots_dir = config_tree
+    path = bots_dir / "1.yaml"
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile[section] = {field: value}
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=rf"{section}\.{field}"):
+        load_bot_profiles(bots_dir)

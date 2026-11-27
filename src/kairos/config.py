@@ -158,6 +158,35 @@ class StaleCheckConfig(_ConfigModel):
         return self
 
 
+class GateConfig(_ConfigModel):
+    enabled: bool = False
+    persona_card: str = Field(default="", max_length=200)
+    recent_messages_limit: int = Field(default=12, gt=0)
+    timeout_seconds: float = Field(default=1.5, gt=0)
+    fail_open: bool = False
+    energy_max: float = Field(default=100.0, gt=0)
+    energy_recover_per_min: float = Field(default=5.0, ge=0)
+    energy_cost_reply: float = Field(default=25.0, ge=0)
+    energy_cost_react: float = Field(default=5.0, ge=0)
+
+
+class CompactionConfig(_ConfigModel):
+    enabled: bool = False
+    input_token_budget: int = Field(default=4096, ge=512)
+    trigger_ratio: float = Field(default=0.75, gt=0, le=1.0)
+    keep_recent_messages: int = Field(default=16, gt=0)
+    summary_max_tokens: int = Field(default=300, gt=0)
+    max_persisted_summaries: int = Field(default=3, gt=0)
+
+
+class MemoryConfig(_ConfigModel):
+    enabled: bool = False
+    warm_trigger_messages: int = Field(default=6, gt=0)
+    max_notes_recalled: int = Field(default=5, ge=0)
+    max_impressions_recalled: int = Field(default=10, ge=0)
+    note_extract_interval_messages: int = Field(default=12, gt=0)
+
+
 class BotProfile(_ConfigModel):
     bot_id: str = Field(min_length=1)
     self_id: int
@@ -166,6 +195,8 @@ class BotProfile(_ConfigModel):
     persona_prompt: str
     llm: dict[str, LLMModelConfig] = Field(default_factory=dict)
     chat_model_key: str = "chat"
+    gate_model_key: str | None = None
+    worker_model_key: str | None = None
     # Legacy YAMLs can still opt into the original ambient-chat behavior.
     trigger_mode: Literal["mention_only", "all_with_veto"] | None = Field(default=None, repr=False)
     allowed_groups: list[int] = Field(default_factory=list)
@@ -174,6 +205,9 @@ class BotProfile(_ConfigModel):
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     stale_check: StaleCheckConfig = Field(default_factory=StaleCheckConfig)
     ring_buffer_size: int = Field(default=40, gt=0)
+    gate: GateConfig = Field(default_factory=GateConfig)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
 
 def _expand_env(value: Any, path: Path) -> Any:
@@ -262,12 +296,17 @@ def load_bot_profiles(
         profile = _load_config_file(path, BotProfile, bot_id=bot_id)
         if profile.self_id in self_ids:
             raise ValueError(f"{path}: duplicate self_id {profile.self_id}")
+        if profile.gate.enabled and profile.gate_model_key is None:
+            raise ValueError(f"{path}: gate.enabled requires gate_model_key")
         models = profile.llm or global_config.llm_models
-        if profile.chat_model_key not in models:
-            location = "llm" if profile.llm else "llm or legacy global llm_models"
-            raise ValueError(
-                f"{path}: unknown chat_model_key {profile.chat_model_key!r} in {location}"
-            )
+        for field, key in (
+            ("chat_model_key", profile.chat_model_key),
+            ("gate_model_key", profile.gate_model_key),
+            ("worker_model_key", profile.worker_model_key),
+        ):
+            if key is not None and key not in models:
+                location = "llm" if profile.llm else "llm or legacy global llm_models"
+                raise ValueError(f"{path}: unknown {field} {key!r} in {location}")
         profiles.append(profile)
         self_ids.add(profile.self_id)
     return profiles
