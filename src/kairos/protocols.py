@@ -7,12 +7,14 @@ from kairos.config import BotProfile
 from kairos.models import (
     AuditRecord,
     ChatMessage,
+    CompactionOutcome,
     ContextSummary,
     GateDecision,
     LLMResult,
     MemoryNote,
     NormalizedMessage,
     ThreadSummary,
+    ToolDefinition,
     UserImpression,
     WarmMemory,
 )
@@ -118,6 +120,29 @@ class ContextCompactor(Protocol):
         existing_summaries: Sequence[ContextSummary] = (),
     ) -> ContextSummary | None: ...
 
+    async def compact_with_outcome(
+        self,
+        profile: BotProfile,
+        group_id: int,
+        messages: Sequence[NormalizedMessage],
+        existing_summaries: Sequence[ContextSummary] = (),
+    ) -> CompactionOutcome:
+        """Adapt implementations of the original single-result interface."""
+        summary = await self.compact(profile, group_id, messages, existing_summaries)
+        return (
+            CompactionOutcome(status="succeeded", summary=summary, attempts=1)
+            if summary
+            else CompactionOutcome(status="skipped")
+        )
+
     def merge_restored_context(
         self, summaries: Sequence[ContextSummary], messages: Sequence[NormalizedMessage]
     ) -> tuple[list[ContextSummary], list[NormalizedMessage]]: ...
+
+
+class ToolRegistryProtocol(Protocol):
+    def catalog_prompt(self, profile: BotProfile) -> str: ...
+
+    def resolve_definitions(
+        self, profile: BotProfile, names: Sequence[str]
+    ) -> list[ToolDefinition]: ...

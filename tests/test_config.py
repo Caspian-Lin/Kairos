@@ -1,9 +1,10 @@
 from pathlib import Path
+from shutil import copyfile
 
 import pytest
 import yaml
 
-from kairos.config import load_bot_profiles, load_global_config
+from kairos.config import CompactionConfig, load_bot_profiles, load_global_config
 
 
 def test_example_configs_load(config_tree: tuple[Path, Path]) -> None:
@@ -18,6 +19,12 @@ def test_example_configs_load(config_tree: tuple[Path, Path]) -> None:
     assert config.onebot_ws.access_token == "test-ws-token"
     assert config.logging.level == "INFO"
     assert not config.llm_models
+    assert not config.admin_ui.enabled
+    assert (config.admin_ui.host, config.admin_ui.port) == ("127.0.0.1", 8081)
+    assert (config.admin_ui.log_buffer_size, config.admin_ui.trace_buffer_size) == (500, 100)
+    assert profile.prompt_style == "companion"
+    assert profile.instruction_reminder == ""
+    assert profile.enabled_tools == []
     model = profile.llm[profile.chat_model_key]
     assert (model.provider, model.request_format, model.model, model.api_key) == (
         "google_ai_studio",
@@ -46,7 +53,10 @@ def test_example_configs_load(config_tree: tuple[Path, Path]) -> None:
     }
     assert profile.compaction.model_dump() == {
         "enabled": False,
-        "input_token_budget": 4096,
+        "input_token_budget": 65536,
+        "trigger_tokens": 65536,
+        "target_summary_tokens": 16384,
+        "max_retries": 3,
         "trigger_ratio": 0.75,
         "keep_recent_messages": 16,
         "summary_max_tokens": 300,
@@ -255,6 +265,10 @@ def test_enabled_gate_requires_local_model(config_tree: tuple[Path, Path]) -> No
         ("gate", "energy_cost_reply", -1),
         ("gate", "energy_cost_react", -1),
         ("compaction", "input_token_budget", 511),
+        ("compaction", "trigger_tokens", 511),
+        ("compaction", "target_summary_tokens", 127),
+        ("compaction", "max_retries", 0),
+        ("compaction", "max_retries", 6),
         ("compaction", "trigger_ratio", 0),
         ("compaction", "trigger_ratio", 1.1),
         ("compaction", "keep_recent_messages", 0),
@@ -277,3 +291,48 @@ def test_m2_config_rejects_invalid_ranges(
 
     with pytest.raises(ValueError, match=rf"{section}\.{field}"):
         load_bot_profiles(bots_dir)
+
+
+def test_strict_example_and_empty_sections(
+    config_tree: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, bots_dir = config_tree
+    template = Path(__file__).resolve().parents[1] / "config/examples/bots/2_strict_tester.yaml"
+    copyfile(template, bots_dir / "2.yaml")
+    (companion,) = load_bot_profiles(bots_dir)
+    monkeypatch.setenv("KAIROS_ENABLED_BOTS", "2")
+    (strict,) = load_bot_profiles(bots_dir)
+    assert strict.self_id == companion.self_id
+    assert strict.bot_id == "2" and strict.prompt_style == "strict" and strict.instruction_reminder
+    for section in ("gate", "compaction", "memory", "debounce", "rate_limit", "stale_check"):
+        assert getattr(strict, section) == getattr(companion, section)
+
+
+def test_legacy_compaction_fields_can_be_loaded() -> None:
+    settings = CompactionConfig(input_token_budget=1024, trigger_ratio=0.5, summary_max_tokens=60)
+    assert settings.input_token_budget == 1024 and settings.trigger_ratio == 0.5
+    assert settings.summary_max_tokens == 60 and settings.max_retries == 3
+
+
+def test_compaction_rejects_invalid_target() -> None:
+    with pytest.raises(ValueError, match="target_summary_tokens must be less"):
+        CompactionConfig(trigger_tokens=1024, target_summary_tokens=1024)
+
+
+def test_admin_config_resolves_token_without_showing_it(
+    config_tree: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    global_path, _ = config_tree
+    monkeypatch.setenv("KAIROS_ADMIN_ACCESS_TOKEN", "test-private-token")
+    payload = yaml.safe_load(global_path.read_text(encoding="utf-8"))
+    payload["admin_ui"] = {
+        "enabled": True,
+        "port": 0,
+        "access_token": "${KAIROS_ADMIN_ACCESS_TOKEN}",
+    }
+    global_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    admin = load_global_config(global_path).admin_ui
+    assert admin.enabled and admin.port == 0
+    assert admin.access_token == "test-private-token"
+    assert "test-private-token" not in repr(admin)

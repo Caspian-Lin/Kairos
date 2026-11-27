@@ -66,12 +66,32 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class ToolDefinition(BaseModel):
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    strict: bool = True
+
+
+class ToolSpec(BaseModel):
+    definition: ToolDefinition
+    catalog_hint: str
+    allowed_profiles: tuple[str, ...] = ("social_companion", "utility_assistant")
+
+
+class ToolCall(BaseModel):
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
 class LLMResult(BaseModel):
     content: str
     model: str
     latency_ms: int
     prompt_tokens: int | None
     completion_tokens: int | None
+    tool_calls: list[ToolCall] = Field(default_factory=list)
 
 
 class ActionType(StrEnum):
@@ -99,6 +119,28 @@ class GateDecision(BaseModel):
     emoji_id: str | None = None
     reason: str = ""
     latency_ms: int = 0
+    need_tools: list[str] = Field(default_factory=list)
+
+
+class PipelineStep(BaseModel):
+    stage: str
+    status: Literal["ok", "skipped", "filtered", "error"]
+    latency_ms: int = 0
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class PipelineTrace(BaseModel):
+    trace_id: str
+    bot_id: str
+    group_id: int
+    msg_id: str
+    sender_alias: str
+    input_preview: str
+    started_at: datetime
+    total_latency_ms: int = 0
+    outcome: str = ""
+    steps: list[PipelineStep] = Field(default_factory=list)
+    request_context: dict[str, Any] | None = None
 
 
 class ThreadSummary(BaseModel):
@@ -119,6 +161,13 @@ class ContextSummary(BaseModel):
     covered_until_at: datetime
     token_estimate: int
     created_at: datetime
+
+
+class CompactionOutcome(BaseModel):
+    status: Literal["skipped", "succeeded", "reset_required"]
+    summary: ContextSummary | None = None
+    attempts: int = 0
+    reason: str = ""
 
 
 class UserImpression(BaseModel):
