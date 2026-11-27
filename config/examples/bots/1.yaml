@@ -1,4 +1,4 @@
-# Replace this sample QQ number with the account logged in to NapCat.
+# 用登录 NapCat 的 QQ 号替换占位号。
 self_id: 10000000000000001
 nickname: 林小满
 profile_type: social_companion
@@ -70,24 +70,52 @@ llm:
   #   thinking_level: minimal
 
 # gate_model_key: gate
-# worker_model_key: worker  # 可选的后台摘要和记忆提取模型
-# gate:
-#   enabled: true
-#   persona_card: 爱聊做饭、游戏和显卡，接得上话题才发言。
-#   recent_messages_limit: 12
-#   timeout_seconds: 1.5
-#   fail_open: false
-# compaction:
-#   enabled: true
-#   input_token_budget: 4096
-#   keep_recent_messages: 16
-# memory:
-#   enabled: true
-#   warm_trigger_messages: 6
-#   max_notes_recalled: 5
+# worker_model_key: worker
+# prompt_style: companion
+# instruction_reminder: ""
+# enabled_tools: []
 
-# List every QQ group ID this Bot may use, e.g. [123456789, 234567890].
-# An empty list allows all groups.
+gate:
+  # enabled: false
+  # persona_card: ""
+  # recent_messages_limit: 12
+  # timeout_seconds: 1.5
+  # fail_open: false
+  # energy_max: 100.0
+  # energy_recover_per_min: 5.0
+  # energy_cost_reply: 25.0
+  # energy_cost_react: 5.0
+
+compaction:
+  # enabled: false
+  # input_token_budget: 65536
+  # trigger_tokens: 65536
+  # target_summary_tokens: 16384
+  # max_retries: 3
+  # keep_recent_messages: 16
+  # max_persisted_summaries: 3
+
+memory:
+  # enabled: false
+  # warm_trigger_messages: 6
+  # max_notes_recalled: 5
+  # max_impressions_recalled: 10
+  # note_extract_interval_messages: 12
+
+debounce:
+  # normal_seconds: 1.8
+  # max_wait_seconds: 4.5
+  # mention_seconds: 0.5
+
+rate_limit:
+  # cooldown_seconds: 3.0
+  # peer_bot_max_turns: 2
+
+stale_check:
+  # direct_max_delta: 1
+  # reply_max_delta: 5
+
+# 填入允许接入的群号。空列表允许所有群。
 allowed_groups: []
-# 在这些白名单群里，Kairos 会提示模型选了沉默。
+# 在这些白名单群里，Kairos 会提示主模型选了沉默。
 debug_groups: []

@@ -7,7 +7,7 @@ from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 _ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _NUMERIC_BOT_ID = re.compile(r"[0-9]+")
@@ -131,11 +131,21 @@ class LoggingConfig(_ConfigModel):
     json_format: bool = False
 
 
+class AdminUIConfig(_ConfigModel):
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = Field(default=8081, ge=0, le=65535)
+    access_token: str | None = Field(default=None, min_length=1, repr=False)
+    log_buffer_size: int = Field(default=500, ge=50, le=5000)
+    trace_buffer_size: int = Field(default=100, ge=20, le=1000)
+
+
 class GlobalConfig(_ConfigModel):
     postgres: PostgresConfig
     onebot_ws: OneBotWSConfig = Field(default_factory=OneBotWSConfig)
     llm_models: dict[str, LLMModelConfig] = Field(default_factory=dict)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    admin_ui: AdminUIConfig = Field(default_factory=AdminUIConfig)
 
 
 class DebounceConfig(_ConfigModel):
@@ -174,11 +184,23 @@ class GateConfig(_ConfigModel):
 
 class CompactionConfig(_ConfigModel):
     enabled: bool = False
-    input_token_budget: int = Field(default=4096, ge=512)
+    input_token_budget: int = Field(default=65536, ge=512)
+    trigger_tokens: int = Field(default=65536, ge=512)
+    target_summary_tokens: int = Field(default=16384, ge=128)
+    max_retries: int = Field(default=3, ge=1, le=5)
     trigger_ratio: float = Field(default=0.75, gt=0, le=1.0)
     keep_recent_messages: int = Field(default=16, gt=0)
     summary_max_tokens: int = Field(default=300, gt=0)
     max_persisted_summaries: int = Field(default=3, gt=0)
+
+    @model_validator(mode="after")
+    def validate_compaction_target(self) -> Self:
+        if {
+            "target_summary_tokens",
+            "trigger_tokens",
+        } <= self.model_fields_set and self.target_summary_tokens >= self.trigger_tokens:
+            raise ValueError("target_summary_tokens must be less than trigger_tokens")
+        return self
 
 
 class MemoryConfig(_ConfigModel):
@@ -195,6 +217,9 @@ class BotProfile(_ConfigModel):
     nickname: str
     profile_type: Literal["social_companion", "utility_assistant"] = "social_companion"
     persona_prompt: str
+    prompt_style: Literal["companion", "strict"] = "companion"
+    instruction_reminder: str = Field(default="", max_length=500)
+    enabled_tools: list[str] = Field(default_factory=list)
     llm: dict[str, LLMModelConfig] = Field(default_factory=dict)
     chat_model_key: str = "chat"
     gate_model_key: str | None = None
@@ -210,6 +235,13 @@ class BotProfile(_ConfigModel):
     gate: GateConfig = Field(default_factory=GateConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+
+    @field_validator(
+        "debounce", "rate_limit", "stale_check", "gate", "compaction", "memory", mode="before"
+    )
+    @classmethod
+    def default_empty_block(cls, value: Any) -> Any:
+        return {} if value is None else value
 
 
 def _expand_env(value: Any, path: Path) -> Any:

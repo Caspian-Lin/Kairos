@@ -11,3 +11,11 @@ onebot_ws:
 logging:
   level: INFO
   json_format: false
+
+admin_ui:
+  enabled: false
+  host: 127.0.0.1
+  port: 8081
+  # access_token: "${KAIROS_ADMIN_ACCESS_TOKEN}"
+  # log_buffer_size: 500
+  # trace_buffer_size: 100
