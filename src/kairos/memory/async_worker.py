@@ -3,7 +3,7 @@
 import asyncio
 import json
 from collections import OrderedDict
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
@@ -64,6 +64,7 @@ class _GroupWork:
     startup_pending: bool = False
     pending: tuple[NormalizedMessage, ...] | None = None
     task: asyncio.Task[None] | None = None
+    reset_at: datetime | None = None
 
 
 class AsyncMemoryWorker:
@@ -76,6 +77,8 @@ class AsyncMemoryWorker:
         llm: LLMClient | None = None,
         *,
         max_groups: int = 64,
+        on_context_reset: Callable[[str, int, Sequence[NormalizedMessage]], ContextSummary | None]
+        | None = None,
     ) -> None:
         self._provider = provider
         self._memory_store = memory_store
@@ -86,6 +89,7 @@ class AsyncMemoryWorker:
         self._max_groups = max_groups
         self._groups: OrderedDict[_GroupKey, _GroupWork] = OrderedDict()
         self._closed = False
+        self._on_context_reset = on_context_reset
 
     def get_warm_memory(self, bot_id: str, group_id: int) -> WarmMemory:
         return self._cache.get_warm_memory(bot_id, group_id)
@@ -203,17 +207,24 @@ class AsyncMemoryWorker:
 
                 key = (profile.bot_id, group_id)
                 if warm_due:
-                    await _run_job("warmup", self._refresh(profile, group_id, messages), key)
+                    await _run_job("warmup", self._refresh(profile, group_id, messages, state), key)
+                reset_before = state.reset_at
                 if self._compaction_due(profile, messages):
-                    await _run_job("compaction", self._compact(profile, group_id, messages), key)
-                if notes_due:
+                    await _run_job(
+                        "compaction", self._compact(profile, group_id, messages, state), key
+                    )
+                if notes_due and state.reset_at == reset_before:
                     await _run_job("extraction", self._extract(profile, group_id, messages), key)
         finally:
             state.task = None
             state.pending = None
 
     async def _refresh(
-        self, profile: BotProfile, group_id: int, messages: Sequence[NormalizedMessage]
+        self,
+        profile: BotProfile,
+        group_id: int,
+        messages: Sequence[NormalizedMessage],
+        state: _GroupWork,
     ) -> None:
         bot_id = profile.bot_id
         if profile.memory.enabled and self._provider is not None:
@@ -234,19 +245,55 @@ class AsyncMemoryWorker:
             return
 
         current = self.get_warm_memory(bot_id, group_id)
+        restored = [*current.summaries, *recalled.summaries]
+        resets = [item.created_at for item in restored if not item.summary_text]
+        if resets:
+            state.reset_at = max([*resets, *([state.reset_at] if state.reset_at else [])])
         summaries = _recent_summaries(
-            [*current.summaries, *recalled.summaries], profile.compaction.max_persisted_summaries
+            [
+                item
+                for item in restored
+                if item.summary_text
+                and (state.reset_at is None or item.created_at > state.reset_at)
+            ],
+            profile.compaction.max_persisted_summaries,
         )
         self._cache.put(bot_id, group_id, recalled.model_copy(update={"summaries": summaries}))
 
     async def _compact(
-        self, profile: BotProfile, group_id: int, messages: Sequence[NormalizedMessage]
+        self,
+        profile: BotProfile,
+        group_id: int,
+        messages: Sequence[NormalizedMessage],
+        state: _GroupWork,
     ) -> None:
         compactor = self._compactor
         current = self.get_warm_memory(profile.bot_id, group_id)
         if compactor is None or not compactor.should_compact(profile, messages, current.summaries):
             return
-        summary = await compactor.compact(profile, group_id, messages, current.summaries)
+        outcome = await compactor.compact_with_outcome(
+            profile, group_id, messages, current.summaries
+        )
+        if outcome.status == "reset_required":
+            state.reset_at = datetime.now(UTC)
+            state.pending = None
+            self.seed_summaries(profile.bot_id, group_id, ())
+            marker = (
+                self._on_context_reset(profile.bot_id, group_id, messages)
+                if self._on_context_reset is not None
+                else None
+            )
+            _log.warning(
+                "context_compaction_reset",
+                bot_id=profile.bot_id,
+                group_id=group_id,
+                attempts=outcome.attempts,
+                reason=outcome.reason,
+            )
+            if marker is not None and self._summary_store is not None:
+                await self._summary_store.save_summary(marker)
+            return
+        summary = outcome.summary
         if summary is None:
             return
         if self._summary_store is not None:
