@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 GROUP_SILENCE_NOTICE = "这条触发成功但是模型选择沉默"
 GROUP_ERROR_PREFIX = "【Kairos 错误】"
@@ -74,6 +74,81 @@ class LLMResult(BaseModel):
     completion_tokens: int | None
 
 
+class ActionType(StrEnum):
+    REPLY = "reply"
+    SILENT = "silent"
+    REACT = "react"
+
+
+class BotAction(BaseModel):
+    action: ActionType
+    content: str = ""
+    target_msg_id: str | None = None
+    emoji_id: str | None = None
+
+
+class GateAction(StrEnum):
+    PASS = "pass"
+    SILENT = "silent"
+    REACT = "react"
+
+
+class GateDecision(BaseModel):
+    action: GateAction
+    candidate_target: str | None = None
+    emoji_id: str | None = None
+    reason: str = ""
+    latency_ms: int = 0
+
+
+class ThreadSummary(BaseModel):
+    thread_id: str
+    root_msg_id: str
+    latest_msg_id: str
+    participants: list[str]
+    message_count: int
+    heat: float
+    last_active_at: datetime
+
+
+class ContextSummary(BaseModel):
+    bot_id: str
+    group_id: int
+    summary_text: str
+    covered_until_msg_id: str
+    covered_until_at: datetime
+    token_estimate: int
+    created_at: datetime
+
+
+class UserImpression(BaseModel):
+    bot_id: str
+    group_id: int
+    user_qq: int
+    nickname: str
+    impression_summary: str
+    affinity_score: float = 0.0
+    updated_at: datetime
+
+
+class MemoryNote(BaseModel):
+    bot_id: str
+    scope_group_id: int
+    entity_qqs: list[int]
+    summary_text: str
+    keywords: list[str]
+    importance: int = 1
+    last_recalled_at: datetime | None = None
+    created_at: datetime
+
+
+class WarmMemory(BaseModel):
+    summaries: list[ContextSummary] = Field(default_factory=list)
+    impressions: list[UserImpression] = Field(default_factory=list)
+    notes: list[MemoryNote] = Field(default_factory=list)
+    threads: list[ThreadSummary] = Field(default_factory=list)
+
+
 class StaleAction(StrEnum):
     SEND_DIRECT = "SEND_DIRECT"
     SEND_WITH_REPLY = "SEND_WITH_REPLY"
@@ -97,3 +172,6 @@ class AuditRecord(BaseModel):
     latency_ms: int
     human_label: str | None = None
     created_at: datetime
+    action_type: str | None = None
+    target_msg_id: str | None = None
+    emoji_id: str | None = None
